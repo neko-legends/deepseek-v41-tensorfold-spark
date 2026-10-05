@@ -290,7 +290,7 @@ index 3adedb62c0506244cc79789aa9d2d596e9284954..5cf652268b4f469bee2e6963e45bfca0
          raise ValueError(f"attn_pf: q bf16 [R, H, 512] contiguous with H a multiple of {bmq}")
      hg = 0
 diff --git a/src/tensorfold/families/deepseek_v41/cuda/csa2/backend.py b/src/tensorfold/families/deepseek_v41/cuda/csa2/backend.py
-index dd80d93d277ac515a5f8f2f0d7589d1df437b4ac..933977ed465a720777acb3004b1f295b9a5590e9 100644
+index dd80d93d277ac515a5f8f2f0d7589d1df437b4ac..11895fe7b19d3131d628b58b1da01fd6dc4fc0b2 100644
 --- a/src/tensorfold/families/deepseek_v41/cuda/csa2/backend.py
 +++ b/src/tensorfold/families/deepseek_v41/cuda/csa2/backend.py
 @@ -173,12 +173,13 @@ def index_kv() -> str:
@@ -299,7 +299,7 @@ index dd80d93d277ac515a5f8f2f0d7589d1df437b4ac..933977ed465a720777acb3004b1f295b
  
 -def _pf_bmq() -> int:
 -    """attn_pf's heads a program: a head count it does not divide (synthetic checkpoints) keeps the chunk kernels."""
-+def _pf_bmq(heads: int) -> int:
++def _pf_bmq(heads: int | None = None) -> int:
 +    """attn_pf's heads a program for ``heads`` (clamped to 16 at TP=4): a head count it does not divide (synthetic
 +    checkpoints) keeps the chunk kernels."""
  
@@ -310,6 +310,15 @@ index dd80d93d277ac515a5f8f2f0d7589d1df437b4ac..933977ed465a720777acb3004b1f295b
  
  
  def fused_prefill() -> bool:
+@@ -395,7 +396,7 @@ class Triton:
+         [groups, R, H / groups x 512] (``wo_a``'s groups read contiguous slices); None where that path does not run
+         (the caller takes ``attention``). The same values as ``attention``'s."""
+ 
+-        if win.rows or not fused_prefill() or q.shape[1] % _pf_bmq() or groups < 1 or q.shape[1] % groups:
++        if win.rows or not fused_prefill() or q.shape[1] % _pf_bmq(q.shape[1]) or groups < 1 or q.shape[1] % groups:
+             return None
+         from . import attn_pf
+ 
 @@ -419,7 +420,7 @@ class Triton:
          rows = comp.kernel() if comp is not None else None
          sink = sink.to(F32).contiguous()
@@ -1818,7 +1827,7 @@ index 0000000000000000000000000000000000000000..65c796fc70473642c8d3b0bf06c651d1
 +
 +__all__ = ["Pipeline", "Stage", "bounds_for", "rows_min"]
 diff --git a/src/tensorfold/families/deepseek_v41/cuda/planlink.py b/src/tensorfold/families/deepseek_v41/cuda/planlink.py
-index 33eb2fe07d8bcb6160716960cfffd0470bfc1edd..ba8c29d3c71bd6240787e496eb854601f7875488 100644
+index 33eb2fe07d8bcb6160716960cfffd0470bfc1edd..92679ddb36ae265ef8369f4e7e9850a83429e269 100644
 --- a/src/tensorfold/families/deepseek_v41/cuda/planlink.py
 +++ b/src/tensorfold/families/deepseek_v41/cuda/planlink.py
 @@ -1,6 +1,6 @@
@@ -1995,7 +2004,7 @@ index 33eb2fe07d8bcb6160716960cfffd0470bfc1edd..ba8c29d3c71bd6240787e496eb854601
  
  
  RDMA_MAGIC = 0x47314452                  # "RD1G": the rdma link's TCP handshake
-@@ -243,19 +321,23 @@ def _runtime(engine_link):
+@@ -243,18 +321,20 @@ def _runtime(engine_link):
      return rt if rt is not None and getattr(rt, "proxy", None) is not None else None
  
  
@@ -2003,8 +2012,9 @@ index 33eb2fe07d8bcb6160716960cfffd0470bfc1edd..ba8c29d3c71bd6240787e496eb854601
 +def make(engine_link, rank: int, master: str, master_port: int, world: int = 2):
      """The batcher's link: ``engine_link`` (the communicator's) unless TF_DSV41_PLAN_LINK=tcp / rdma (G14); wrapped by
 -    ``Pinned`` under TF_DSV41_PLAN_PIN."""
-+    ``Pinned`` under TF_DSV41_PLAN_PIN. ``rdma``'s mailbox is one queue pair to one peer: with more than two ranks the
-+    plan goes over ``tcp`` to every follower (a collective decision: every rank sees the same world)."""
++    ``Pinned`` under TF_DSV41_PLAN_PIN. ``rdma`` at any world size: the mailbox (``roce_msg.h``) is one sender and
++    every other rank a receiver (the proxy posts each chunk to every peer; a slot is reused once every receiver acked
++    it); the TCP links to the followers carry the handshake and their liveness."""
  
      m = mode()
      if m == "nccl":
@@ -2013,18 +2023,12 @@ index 33eb2fe07d8bcb6160716960cfffd0470bfc1edd..ba8c29d3c71bd6240787e496eb854601
 -        link = TcpLink(rank, master, port_for(master_port))
 +        link = TcpLink(rank, master, port_for(master_port), world=world)
      else:
--        rt = _runtime(engine_link)
+         rt = _runtime(engine_link)
 -        tcp = TcpLink(rank, master, port_for(master_port))
--        if rt is None:                          # NCCL on both ranks (the RoCE setup is collective): plain tcp
-+        rt = _runtime(engine_link) if world == 2 else None
 +        tcp = TcpLink(rank, master, port_for(master_port), world=world)
-+        if rt is None and world != 2:
-+            print(f"[dsv41] plan link: {ENV}=rdma is two-rank only (world {world}): tcp", flush=True)
-+            link = tcp
-+        elif rt is None:                          # NCCL on both ranks (the RoCE setup is collective): plain tcp
+         if rt is None:                          # NCCL on both ranks (the RoCE setup is collective): plain tcp
              print(f"[dsv41] plan link: {ENV}=rdma without a RoCE runtime: tcp", flush=True)
              link = tcp
-         else:
 diff --git a/src/tensorfold/families/deepseek_v41/cuda/ppbench.py b/src/tensorfold/families/deepseek_v41/cuda/ppbench.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..e6311ebbcf86b69f9c47cd2b8e5973b44c871a06
@@ -2943,10 +2947,10 @@ index ca89c7994dd125322a540d913d82f87e64459001..9df8911e832b05ff5b5a00758ce5be52
  
 diff --git a/tests/test_dsv41_four_sparks.py b/tests/test_dsv41_four_sparks.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..6bdfc046308b3b94fd71cdd9ebb016b9b3d0368e
+index 0000000000000000000000000000000000000000..f256edd33e0cd8010287dd56ef594ea3ab7f3a45
 --- /dev/null
 +++ b/tests/test_dsv41_four_sparks.py
-@@ -0,0 +1,366 @@
+@@ -0,0 +1,431 @@
 +# SPDX-License-Identifier: MIT
 +"""Four ranks with uneven slices: the bugs jayleaton's review of the TP=4 port found (PR #6), each pinned here.
 +
@@ -3313,6 +3317,71 @@ index 0000000000000000000000000000000000000000..6bdfc046308b3b94fd71cdd9ebb016b9
 +        return True
 +
 +    assert all(pair.run([lambda r=r: go(r) for r in range(4)]))
++
++
++# -- G19's fail-fast and memory floor at four ranks ------------------------------------------------------------------
++def fates_of_four(usable=None):
++    """Rank 0 with a fate channel to each of three followers (socket pairs), every exit recorded."""
++
++    import io
++    import socket as S
++
++    from tensorfold.families.deepseek_v41.cuda import failfast as FF
++
++    exits = {r: [] for r in range(4)}
++    pairs = [S.socketpair() for _ in range(3)]
++    f0 = FF.Fate(0, [FF.Channel(0, a, r + 1) for r, (a, _) in enumerate(pairs)], exit_fn=exits[0].append,
++                 grace_s=0.05, report_s=0.05, out=io.StringIO())
++    fs = [FF.Fate(r + 1, FF.Channel(r + 1, b, 0), exit_fn=exits[r + 1].append, grace_s=0.05, report_s=0.05,
++                  usable=(lambda r=r: (usable or [8, 6, 9])[r] << 30), out=io.StringIO()) for r, (_, b) in enumerate(pairs)]
++    return f0, fs, exits
++
++
++def test_failfast_four_ranks_one_follower_fails_all_exit():
++    import time
++
++    f0, fs, exits = fates_of_four()
++    for f in [f0, *fs]:
++        f.start()
++    time.sleep(0.3)
++    fs[1].fatal(RuntimeError("boom"), "prefill")                    # rank 2
++    deadline = time.monotonic() + 5
++    while time.monotonic() < deadline and not all(exits[r] for r in range(4)):
++        time.sleep(0.05)
++    assert all(exits[r] == [70] for r in range(4)), exits
++    assert "rank 2 failed in prefill" in f0.dead
++
++
++def test_floor_reads_the_tightest_of_three_followers():
++    import time
++
++    from tensorfold.families.deepseek_v41.cuda import memory as M
++
++    f0, fs, _ = fates_of_four([8, 6, 9])
++    for f in [f0, *fs]:
++        f.start()
++    deadline = time.monotonic() + 5
++    while time.monotonic() < deadline and f0.peer_mem() is None:
++        time.sleep(0.05)
++    got = f0.peer_mem()
++    assert got is not None and got[0] == 6 << 30 and got[2] == 2   # rank 2 is the tightest
++    floor = M.Floor(5.0, 4.0, meminfo=lambda: {"MemFree": 20 << 30, "MemAvailable": 20 << 30}, peer=f0.peer_mem)
++    assert floor.tight() == (2, 6 << 30)
++    assert floor.check(1 << 30) and not floor.check(3 << 30)         # 6 - 3 < 4 GiB hard floor on rank 2
++    for f in [f0, *fs]:
++        f.close()
++
++
++def test_image_segments_skip_the_prompt_pipeline():
++    from tensorfold.families.deepseek_v41.cuda import pipe as PP
++    from tensorfold.families.deepseek_v41.cuda.vision_prep import VBASE
++
++    p = PP.Pipeline.__new__(PP.Pipeline)
++    p.slot, p.min_rows = None, 16
++    assert p.takes(0, 64, list(range(64)))
++    assert not p.takes(0, 64, [5] * 63 + [VBASE + 3])
++    p.slot = 0
++    assert not p.takes(0, 64, [VBASE])                               # even mid-line: the caller drains first
 diff --git a/tests/test_dsv41_overlap.py b/tests/test_dsv41_overlap.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..1dd7d05232112e5b27b9a2541335635002a800a1
