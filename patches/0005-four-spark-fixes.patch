@@ -21,10 +21,12 @@ Subject: [PATCH] deepseek_v41: four-Spark fixes from the TP=4 review (uneven
 - attn_pf: BMQ 32 on a rank with 16 heads runs with 16 heads a program
   (was: a silent fallback to the chunk kernels)
 - NVMe session tier: the world size is part of the compat ident
-- candidates' pinned buffer grown before a window's forward is queued
-  (cand_reserve), not after: the first sampled request with top_k in the
-  tens of thousands timed out every follower's Engram gate at layer 14
-  (found on four Sparks while testing the above)
+- candidate kernels warmed at boot on every rank (cand_warm: every width
+  class through the gather, merge and device sampler) and the candidates'
+  pinned buffer grown before a window's forward (cand_reserve): the first
+  sampled request with top_k in the tens of thousands loaded the large-k
+  kernels mid-window (CUDA lazy loading) and every follower's Engram gate
+  timed out at layer 14 (found on four Sparks while testing the above)
 - gate scorer: any rank count (was two); DSpark delta shards follow the
   128-block split
 - tests: test_dsv41_four_sparks.py; the thread communicator refuses unequal
@@ -39,16 +41,16 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../families/deepseek_v41/cuda/decode.py      |   1 +
  .../families/deepseek_v41/cuda/draft_head.py  |  15 +-
  .../families/deepseek_v41/cuda/dsparkdelta.py |  17 +-
- .../families/deepseek_v41/cuda/engine.py      |   6 +-
+ .../families/deepseek_v41/cuda/engine.py      |   7 +-
  .../families/deepseek_v41/cuda/forward.py     |   1 +
  .../families/deepseek_v41/cuda/gate.py        |  13 +-
  .../families/deepseek_v41/cuda/pick.py        |  33 +-
  .../families/deepseek_v41/cuda/planlink.py    |  97 ++++-
- .../families/deepseek_v41/cuda/slots.py       |  20 +-
+ .../families/deepseek_v41/cuda/slots.py       |  51 ++-
  .../families/deepseek_v41/cuda/stack.py       |   2 +-
  tests/dsv41_fakes.py                          |   3 +
- tests/test_dsv41_four_sparks.py               | 351 ++++++++++++++++++
- 16 files changed, 538 insertions(+), 44 deletions(-)
+ tests/test_dsv41_four_sparks.py               | 366 ++++++++++++++++++
+ 16 files changed, 585 insertions(+), 44 deletions(-)
  create mode 100644 tests/test_dsv41_four_sparks.py
 
 diff --git a/src/tensorfold/cli.py b/src/tensorfold/cli.py
@@ -210,10 +212,18 @@ index 31d0945c05ed2db104440ce15bb2c39837057b15..3ded78e250bdf678f5e29aba3586c4a5
  
  
 diff --git a/src/tensorfold/families/deepseek_v41/cuda/engine.py b/src/tensorfold/families/deepseek_v41/cuda/engine.py
-index de4b96312d1b75775ceaf3fd0171f3838fdebe4c..6137eeab74f3f5a520e544661de98534ef0390ac 100644
+index de4b96312d1b75775ceaf3fd0171f3838fdebe4c..76977aa0f772e8c45e5fb558625e771de33a5eef 100644
 --- a/src/tensorfold/families/deepseek_v41/cuda/engine.py
 +++ b/src/tensorfold/families/deepseek_v41/cuda/engine.py
-@@ -312,9 +312,7 @@ class Dsv41Engine:
+@@ -237,6 +237,7 @@ class Dsv41Engine:
+                     torch.cuda.empty_cache()
+                 fastboot.mark("pipeline", f"{self.fw.pipe.describe()}; "
+                               f"{torch.cuda.memory_allocated() / 2 ** 30 if cuda else 0:.1f} GiB allocated")
++            self.fw.cand_warm()             # every candidate width's kernels loaded before serving (slots.py)
+             if callable(getattr(self.fw, "boot", None)):
+                 self.fw.boot(self)          # graph warm-up (15 s budget), the cost table (cached per image / shape)
+                 fastboot.mark("M2 boot", self.fw.describe())
+@@ -312,9 +313,7 @@ class Dsv41Engine:
          torch = self.torch
          greedy = sampling is None or sampling.temperature <= 0
          k = 1 if greedy else (int(sampling.top_k) + MARGIN if sampling.top_k else NUCLEUS_CANDIDATES)
@@ -224,7 +234,7 @@ index de4b96312d1b75775ceaf3fd0171f3838fdebe4c..6137eeab74f3f5a520e544661de98534
          packed = torch.cat([vals, ids.view(torch.float32)], 1).contiguous()
          w = self.world
          got = torch.empty((w * packed.numel(),), dtype=torch.float32, device=logits.device)
-@@ -323,6 +321,8 @@ class Dsv41Engine:
+@@ -323,6 +322,8 @@ class Dsv41Engine:
          comm_mod.check(self.comm)           # a failed RoCE exchange raises before any token
          values = torch.cat([g[r, :, :k] for r in range(w)], 1).numpy().astype(np.float32)
          tokens = torch.cat([g[r, :, k:].contiguous().view(torch.int32) for r in range(w)], 1).numpy().astype(np.int64)
@@ -461,7 +471,7 @@ index 5f41827c956f62e91a9730ce1f4ac4ece1e2efb2..0e0dc0ab2e04c3e702de9fc2825f82c7
      """The batcher's link: ``engine_link`` (the communicator's) unless TF_DSV41_PLAN_LINK=tcp."""
  
 diff --git a/src/tensorfold/families/deepseek_v41/cuda/slots.py b/src/tensorfold/families/deepseek_v41/cuda/slots.py
-index 96c7770f477e1534795f430801f61c68048bec7f..18792427a0bf09e872df3dd1759494d6b977d1bf 100644
+index 96c7770f477e1534795f430801f61c68048bec7f..a54b83a515e294cf8b9dd9e0dce707b7d69141ce 100644
 --- a/src/tensorfold/families/deepseek_v41/cuda/slots.py
 +++ b/src/tensorfold/families/deepseek_v41/cuda/slots.py
 @@ -218,6 +218,7 @@ class SlotsForward(Forward):
@@ -483,10 +493,41 @@ index 96c7770f477e1534795f430801f61c68048bec7f..18792427a0bf09e872df3dd1759494d6
          packed = torch.cat([vals, ids.view(torch.float32)], 1).contiguous()
          if self.world > 1:
              got = torch.empty((self.world * packed.numel(),), dtype=torch.float32, device=packed.device)
-@@ -259,6 +258,21 @@ class SlotsForward(Forward):
+@@ -259,6 +258,52 @@ class SlotsForward(Forward):
              return got.view(self.world, R, 2 * k), k
          return packed.view(1, R, 2 * k), k
  
++    def cand_warm(self, rows: int = 4) -> None:
++        """Run every candidate width class once at boot (every rank, the same calls), so their kernels are loaded
++        before serving: verify-window counts, a nucleus row's 512, wide top_k, the whole vocabulary (masked nucleus
++        rows), and the device sampler (``vsample.choose``, the speculative pass) over each.
++
++        Why (2026-10-05, four Sparks): with CUDA's lazy module loading, the first window that needed the large-k
++        top-k and large-row sort kernels (a sampled request with top_k in the tens of thousands) loaded them while
++        the window's forward was still running, and module loading waits for the device: the forward's Engram gate
++        and the RoCE exchanges wait for host threads, and every follower timed out at layer 14. A masked nucleus
++        request, whose full-vocabulary candidates come after its window, had loaded them first in every run that
++        passed."""
++
++        from . import nucleus as NU
++        from . import vsample as VS
++
++        vl = int(self.embed.shape[0])                       # this rank's vocabulary columns
++        dev = self.device
++        lg = torch.linspace(-4.0, 4.0, rows * vl, device=dev).view(rows, vl).to(torch.bfloat16).float()
++        z = torch.zeros((rows,), dtype=torch.int64, device=dev)
++        floats = torch.tensor([[1.0, 0.9, 0.02]] * rows, dtype=torch.float64, device=dev)
++        for count in (1, 9, 64, 520, 4104, 32776, self.vocab):
++            g, k = self.cand_gather(lg, [rows], count)
++            h = self.cand_fetch(g, k, count)
++            for mode in ((0, 0), (20, 1), (0, 1)):
++                ints = torch.tensor([list(mode)] * rows, dtype=torch.int64, device=dev)
++                VS.choose(h.vals, h.ids, z, z, ints, floats)
++            self.cand_wait(h)
++        NU.row_stats(lg, torch.ones((rows,), dtype=torch.float64))
++        if dev.type == "cuda":
++            torch.cuda.synchronize(dev)
++
 +    def cand_reserve(self, rows: int, count: int) -> None:
 +        """Grow the candidates' pinned buffer for ``rows`` rows of ``count`` before the window's forward is queued.
 +
@@ -534,10 +575,10 @@ index ca89c7994dd125322a540d913d82f87e64459001..9df8911e832b05ff5b5a00758ce5be52
  
 diff --git a/tests/test_dsv41_four_sparks.py b/tests/test_dsv41_four_sparks.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..47a151beb4b3c6364831d160ffcbe0cb92d95546
+index 0000000000000000000000000000000000000000..6bdfc046308b3b94fd71cdd9ebb016b9b3d0368e
 --- /dev/null
 +++ b/tests/test_dsv41_four_sparks.py
-@@ -0,0 +1,351 @@
+@@ -0,0 +1,366 @@
 +# SPDX-License-Identifier: MIT
 +"""Four ranks with uneven slices: the bugs jayleaton's review of the TP=4 port found (PR #6), each pinned here.
 +
@@ -889,6 +930,21 @@ index 0000000000000000000000000000000000000000..47a151beb4b3c6364831d160ffcbe0cb
 +    order.clear()
 +    fw.window([Rows(0, len(PROMPTS[0]) - 1, (PROMPTS[0][-1],))], count=300)
 +    assert order[:2] == [("reserve", 1, 300), ("forward",)]
++
++
++def test_candidate_warmup_on_four_ranks(ck4):
++    """``cand_warm`` (boot, every rank): every width class through the gather, the merge and the device sampler,
++    at counts past the narrow slices, with equal exchange sizes on four ranks."""
++
++    pair = FK.ThreadPair(4)
++    comms = pair.comms()
++
++    def go(r):
++        f = DF.forward(ck4, rank=r, world=4, comm=comms[r], dspark=False)
++        f.cand_warm()
++        return True
++
++    assert all(pair.run([lambda r=r: go(r) for r in range(4)]))
 -- 
 2.43.0
 
