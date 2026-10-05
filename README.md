@@ -170,6 +170,63 @@ The fixes:
   once answered a first `top_k` 32,000 request without the warm-up.
 - The gate scorer and DSpark delta shards (both off in production) now handle any rank count and uneven splits.
 
+## How it was tested (2026-10-05)
+
+Every number and claim on this page was checked these ways before `main` moved to it.
+
+**1. The patches rebuild the engine exactly.** TensorFold v0.6.0 (`vendor/TensorFold`) with `patches/0001`-`0005`
+applied in order gives the same tree, file for file, as the engine branch the work was done on:
+
+```bash
+cp -r vendor/TensorFold /tmp/tf && cd /tmp/tf && rm -rf .git
+for p in "$OLDPWD"/patches/*.patch; do git apply --whitespace=nowarn "$p"; done
+```
+
+**2. The CPU test suites pass on that tree.** No GPU needed: the tests run the engine's CPU twin, with four ranks as
+threads where it matters (`pip install torch numpy safetensors pytest`; run each file in its own process, as some keep
+large fixtures):
+
+```bash
+cd /tmp/tf
+for f in tests/test_dsv41_*.py tests/test_cuda_cli.py; do python -m pytest -q "$f"; done
+```
+
+On the final tree, 23 files (every DeepSeek V4.1 suite that the TP=4 patches touch, and the CLI suites): **327
+passed, 2 failed**. Both failures are older than this fork's patches and unrelated to four Sparks:
+`test_cuda_cli.py::test_serve_parses_the_kv_cache_flag` (an upstream test that still expects `--kv-dtype fp8` to be
+refused; `patches/0002` adds it) and `test_dsv41_draft_head.py::test_shipped_ranking` (needs the unpublished draft
+vocabulary file). The four-Spark tests:
+
+| file | what it checks | tests |
+| --- | --- | ---: |
+| `test_dsv41_tp4.py` (0003) | uneven 128-block splits; four ranks == one rank in exact numerics; ranks agree bit for bit; row invariance; greedy over uneven vocabulary slices; Engram from `of4` shards | 8 |
+| `test_dsv41_overlap.py`, `test_dsv41_pipe.py` (0004) | split selections and overlapped exchanges == one segment; a pipelined prompt leaves the tensor-parallel state, at 2 and 4 ranks, through a mid-prompt snapshot, over point-to-point | 12 |
+| `test_dsv41_four_sparks.py` (0005) | every fix in the list above; run without the fixes, each review bug's test fails | 20 |
+
+The thread communicator in these tests refuses all-gathers whose ranks send different sizes, as NCCL requires, so a
+mismatch fails a test instead of hanging a Spark.
+
+**3. The image builds from a fresh clone.** `git clone --recurse-submodules` of this repository, then
+`docker build -f docker/Dockerfile .` exactly as in [Quick start](#quick-start), shipped to the three workers with
+`scripts/serve4.sh ship`: that image is the one serving on our four Sparks.
+
+**4. On the four Sparks, before it went live.** Each candidate build ran in a test window (the live server stopped,
+the build started with an empty session cache, the checks, the live server restored), and it was promoted only if
+every check passed:
+
+- the depth bench's 20k and 160k prompts, prose and code, read cold: same first-token times and byte-identical
+  replies to the previous build;
+- a code word hidden at 30 / 60 / 85% of 20k / 80k / 158k-token prompts: 3 / 3;
+- the short gates (arithmetic, forced tool call, tool continuation, strict JSON at three temperatures, reasoning):
+  7 / 7;
+- sampled requests past the narrow slices: nucleus, nucleus with min_p, `top_k` 40,000 and 32,000, `top_k` 20, a
+  JSON schema with nucleus sampling: 6 / 6, and `top_k` 40,000 as the first request after a fresh boot;
+- decode against the previous build, four boots alternating in one window: the same within noise.
+
+Three candidate builds failed the wide-request check before the shipped one passed; they never served. The previous
+build was also tested on the same wide request: it crashed ranks 2 and 3. All of it, run by run:
+[`results/four-spark-fixes-20261005/`](results/four-spark-fixes-20261005/README.md).
+
 ## What is not solved
 
 - **Jay's G14-G19 are not in this fork.** This fork branched at engine G13; his newer main (image input, fail-fast

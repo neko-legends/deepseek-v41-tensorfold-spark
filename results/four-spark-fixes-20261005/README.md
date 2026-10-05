@@ -58,5 +58,5 @@ rank's; greedy, top-k and nucleus decoding on four ranks == one rank token for t
 ranks; the plan link's handshake (rank order, a stray client, a duplicate rank, another world size, a missing rank);
 `--tp 4` scope; the BMQ clamp; the session tier's world; DSpark delta shards; the boot warm-up. Run without the fixes,
 each review bug's test fails (unequal gather sizes, the draft head's boot refusal, no handshake). The other DeepSeek
-V4.1 suites pass, except two that also fail before 0005 (`test_serve_parses_the_kv_cache_flag`: 0002 adds
+V4.1 suites pass (on the final tree: 23 files, 327 passed), except two that also fail before 0005 (`test_serve_parses_the_kv_cache_flag`: 0002 adds
 `--kv-dtype fp8`; `test_shipped_ranking`: the draft vocabulary file is not published).
