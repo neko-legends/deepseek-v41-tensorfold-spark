@@ -1,0 +1,828 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: neko-legends <neko-legends@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 09:06:47 -0700
+Subject: [PATCH] deepseek_v41: four-Spark fixes from the TP=4 review (uneven
+ slices, N ranks)
+
+- candidates over the vocabulary: every rank sends k = min(count, widest
+  slice) (pick.rank_top), narrower slices padded with (-inf, PAD) that sort
+  after every real token; slots.cand_gather and engine.choose (the host
+  merge drops the padding). Before: k = min(count, own width), so a count
+  above 32,256 (nucleus rows ask for the whole vocabulary) all-gathered
+  unequal sizes at TP=4
+- draft head trim: per-rank lists from weights.block_bounds (was r * n:
+  rank 2 refused to boot at TP=4); refuses rows wider than the narrowest
+  slice by name
+- TCP plan link: followers send a hello (magic, rank, world) and wait for
+  rank 0's answer; rank 0 refuses strays, duplicates and another world
+  size, orders the connections by rank, names a rank that never connected
+- CLI: --tp above 2 only for families that declare it (CUDA_TP; deepseek_v41:
+  (2, 4))
+- attn_pf: BMQ 32 on a rank with 16 heads runs with 16 heads a program
+  (was: a silent fallback to the chunk kernels)
+- NVMe session tier: the world size is part of the compat ident
+- gate scorer: any rank count (was two); DSpark delta shards follow the
+  128-block split
+- tests: test_dsv41_four_sparks.py; the thread communicator refuses unequal
+  all-gather sizes (NCCL's contract)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/tensorfold/cli.py                         |   3 +
+ .../families/deepseek_v41/__init__.py         |   1 +
+ .../deepseek_v41/cuda/csa2/attn_pf.py         |  10 +-
+ .../deepseek_v41/cuda/csa2/backend.py         |   9 +-
+ .../families/deepseek_v41/cuda/draft_head.py  |  15 +-
+ .../families/deepseek_v41/cuda/dsparkdelta.py |  17 +-
+ .../families/deepseek_v41/cuda/engine.py      |   6 +-
+ .../families/deepseek_v41/cuda/forward.py     |   1 +
+ .../families/deepseek_v41/cuda/gate.py        |  13 +-
+ .../families/deepseek_v41/cuda/pick.py        |  33 +-
+ .../families/deepseek_v41/cuda/planlink.py    |  97 ++++-
+ .../families/deepseek_v41/cuda/slots.py       |   4 +-
+ .../families/deepseek_v41/cuda/stack.py       |   2 +-
+ tests/dsv41_fakes.py                          |   3 +
+ tests/test_dsv41_four_sparks.py               | 332 ++++++++++++++++++
+ 15 files changed, 502 insertions(+), 44 deletions(-)
+ create mode 100644 tests/test_dsv41_four_sparks.py
+
+diff --git a/src/tensorfold/cli.py b/src/tensorfold/cli.py
+index d25a0cb3015e7805c7f74957912836d54232d890..1df07ff3b475ca62a0a24caa84fd906350d788a6 100644
+--- a/src/tensorfold/cli.py
++++ b/src/tensorfold/cli.py
+@@ -232,6 +232,9 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
+ 
+     from tensorfold import hub
+ 
++    sizes = tuple(getattr(family.package, "CUDA_TP", (1, 2)))     # a family opts in to more ranks (deepseek_v41: 4)
++    if args.tp not in sizes and args.tp > 2:
++        raise ValueError(f"--tp {args.tp}: {family.title} runs with --tp " + " / ".join(str(n) for n in sizes))
+     if args.tp > 1 and not args.master:
+         raise ValueError(f"--tp {args.tp} needs --master: rank 0's address on the link between the machines")
+     if not 0 <= args.rank < args.tp:
+diff --git a/src/tensorfold/families/deepseek_v41/__init__.py b/src/tensorfold/families/deepseek_v41/__init__.py
+index 0f87d3632083afbd0e473fab66d7e2d9947229d5..835a67e365bfaeb35da4c2715be3ee2761e4c525 100644
+--- a/src/tensorfold/families/deepseek_v41/__init__.py
++++ b/src/tensorfold/families/deepseek_v41/__init__.py
+@@ -24,6 +24,7 @@ MODELS = ("dealignai/DeepSeek-V4.1-Flash-UNCENSORED-EXL3-2.9bpw", "MiaAI-Lab/Dee
+ QUANT_METHODS = {"cuda": ("exl3",)}
+ # The KV cache is the 584-byte FP8 record (``cuda/csa2/rows.py``, the kit's ``fp8_ds_mla``): serve with --kv-dtype fp8
+ CUDA_KV_DTYPES = ("fp8",)
++CUDA_TP = (2, 4)                      # ranks, one a Spark (the CLI refuses --tp 4 for families without it)
+ CACHE_FORMAT = "fp8_ds_mla"
+ DRAFTER = ""                          # DSpark is the checkpoint's own mtp.* blocks (M2), not a separate model
+ REQUIRED_FILES: dict = {}
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/csa2/attn_pf.py b/src/tensorfold/families/deepseek_v41/cuda/csa2/attn_pf.py
+index 76fe11bf35f51da1a2ea8b6bc423b04fbe884ece..8afb463a0d7150a7634864852c590cfa1f99c358 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/csa2/attn_pf.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/csa2/attn_pf.py
+@@ -49,13 +49,17 @@ def variant() -> int:
+     return PM.attn_variant()
+ 
+ 
+-def config() -> tuple[int, int]:
+-    """(BMQ heads a program, warps): ``TF_DSV41_PREFILL_ATTN_BMQ`` (16 / 32), ``TF_DSV41_PREFILL_ATTN_WARPS`` (8)."""
++def config(heads: int | None = None) -> tuple[int, int]:
++    """(BMQ heads a program, warps): ``TF_DSV41_PREFILL_ATTN_BMQ`` (16 / 32), ``TF_DSV41_PREFILL_ATTN_WARPS`` (8).
++    With ``heads`` (a rank's query heads): BMQ 32 on a rank with 16 heads (TP=4) is clamped to 16, the same kernel
++    one tile a program, instead of the chunk kernels' fallback (a two-Spark prod.env on four Sparks)."""
+ 
+     bmq = int(os.environ.get("TF_DSV41_PREFILL_ATTN_BMQ", "") or 16)
+     warps = int(os.environ.get("TF_DSV41_PREFILL_ATTN_WARPS", "") or 8)
+     if bmq not in (16, 32) or warps not in (4, 8, 16):
+         raise ValueError(f"TF_DSV41_PREFILL_ATTN_BMQ={bmq} (16 / 32), TF_DSV41_PREFILL_ATTN_WARPS={warps} (4 / 8 / 16)")
++    if heads is not None and heads % bmq and heads % 16 == 0:
++        bmq = 16
+     return bmq, warps
+ 
+ 
+@@ -120,7 +124,7 @@ def attention(q: torch.Tensor, comp, tokens: torch.Tensor | None, counts: torch.
+     pos int32 [1], sink fp32 [H], cs the RoPE table -> out bf16 [R, H, 512]."""
+ 
+     R, H, _ = q.shape
+-    bmq, warps = config()
++    bmq, warps = config(H)
+     if H % bmq or not q.is_contiguous() or q.dtype != torch.bfloat16 or q.shape[2] != D:
+         raise ValueError(f"attn_pf: q bf16 [R, H, 512] contiguous with H a multiple of {bmq}")
+     if ring <= 0 or ring & (ring - 1) or ring < WINDOW or ring < R + WINDOW - 1:
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/csa2/backend.py b/src/tensorfold/families/deepseek_v41/cuda/csa2/backend.py
+index e685631e09dd21d6eec68777a34186bb8fd5e1a1..0000c798ee589ca53eff031315b4e5d6452ba8a2 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/csa2/backend.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/csa2/backend.py
+@@ -173,12 +173,13 @@ def index_kv() -> str:
+     return v
+ 
+ 
+-def _pf_bmq() -> int:
+-    """attn_pf's heads a program: a head count it does not divide (synthetic checkpoints) keeps the chunk kernels."""
++def _pf_bmq(heads: int) -> int:
++    """attn_pf's heads a program for ``heads`` (clamped to 16 at TP=4): a head count it does not divide (synthetic
++    checkpoints) keeps the chunk kernels."""
+ 
+     from . import attn_pf
+ 
+-    return attn_pf.config()[0]
++    return attn_pf.config(heads)[0]
+ 
+ 
+ def fused_prefill() -> bool:
+@@ -401,7 +402,7 @@ class Triton:
+         rows = comp.kernel() if comp is not None else None
+         sink = sink.to(F32).contiguous()
+         # G7: fast prefill runs, every row of the run in one pass
+-        if hi is None and not win.rows and fused_prefill() and q.shape[1] % _pf_bmq() == 0:
++        if hi is None and not win.rows and fused_prefill() and q.shape[1] % _pf_bmq(q.shape[1]) == 0:
+             from . import attn_pf
+ 
+             return attn_pf.attention(q, rows, sel, counts, swa.kernel(), lo, win.t, sink, table.cs, out, ring=ring,
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/draft_head.py b/src/tensorfold/families/deepseek_v41/cuda/draft_head.py
+index 1f17989b3da01bd18e571570abcbeb978f4908e6..606871b1e36ba119766ec3e245e9e38c40fe04b4 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/draft_head.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/draft_head.py
+@@ -254,12 +254,17 @@ class DraftHead:
+         if self.mode == "trim":
+             order = [i for i in ranking(st.vocab) if 0 <= i < V]
+             self.digest = hashlib.sha256(np.asarray(order, dtype=np.int64).tobytes()).hexdigest()[:12]
+-            lists = [per_rank(order, r * n, min(V, (r + 1) * n), st.rows) for r in range(world)]
+-            if len({len(x) for x in lists}) != 1:
+-                raise ValueError("draft head: the ranks' lists differ in length (an uneven vocabulary split)")
++            from .weights import block_bounds
++
++            spans = [block_bounds(V, world, r) for r in range(world)]     # the head's 128-block column slices
++            if spans[fw.rank] != (fw.vocab_lo, fw.vocab_lo + n):
++                raise ValueError(f"draft head: rank {fw.rank}'s columns are {fw.vocab_lo} .. {fw.vocab_lo + n - 1}, "
++                                 f"the vocabulary split says {spans[fw.rank][0]} .. {spans[fw.rank][1] - 1}")
++            lists = [per_rank(order, lo, hi, st.rows) for lo, hi in spans]
++            if len({len(x) for x in lists}) != 1:     # every rank sends the same candidates a row (one gather)
++                raise ValueError(f"draft head: TF_DSV41_DRAFT_HEAD rows {st.rows} exceed the narrowest rank's "
++                                 f"{min(hi - lo for lo, hi in spans)} columns")
+             mine = lists[fw.rank]
+-            if mine.size and (mine[0] < fw.vocab_lo or mine[-1] >= fw.vocab_lo + n):
+-                raise ValueError("draft head: rank r's half is ids r n .. (r + 1) n - 1")
+             listed = np.zeros((V,), dtype=bool)
+             for x in lists:
+                 listed[x] = True
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/dsparkdelta.py b/src/tensorfold/families/deepseek_v41/cuda/dsparkdelta.py
+index 31d0945c05ed2db104440ce15bb2c39837057b15..3ded78e250bdf678f5e29aba3586c4a58c9f109a 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/dsparkdelta.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/dsparkdelta.py
+@@ -50,12 +50,21 @@ def shard(kind: str, A: torch.Tensor, B: torch.Tensor, rank: int, world: int) ->
+ 
+     if world <= 1 or kind == "":
+         return A, B
++
++    def span(total: int) -> tuple[int, int]:      # the weights' own split: whole 128-blocks (uneven at TP=4)
++        if total % 128 == 0:
++            from .weights import block_bounds
++
++            return block_bounds(total, world, rank)
++        n = total // world
++        return rank * n, (rank + 1) * n
++
+     if kind == "col":
+-        n = B.shape[0] // world
+-        return A, B[rank * n:(rank + 1) * n]
++        lo, hi = span(B.shape[0])
++        return A, B[lo:hi]
+     if kind == "row":
+-        k = A.shape[1] // world
+-        return A[:, rank * k:(rank + 1) * k], B
++        lo, hi = span(A.shape[1])
++        return A[:, lo:hi], B
+     raise ValueError(kind)
+ 
+ 
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/engine.py b/src/tensorfold/families/deepseek_v41/cuda/engine.py
+index de4b96312d1b75775ceaf3fd0171f3838fdebe4c..6137eeab74f3f5a520e544661de98534ef0390ac 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/engine.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/engine.py
+@@ -312,9 +312,7 @@ class Dsv41Engine:
+         torch = self.torch
+         greedy = sampling is None or sampling.temperature <= 0
+         k = 1 if greedy else (int(sampling.top_k) + MARGIN if sampling.top_k else NUCLEUS_CANDIDATES)
+-        k = min(k, logits.shape[1])
+-        vals, ids = P.top(logits.float(), k)       # ties: the lower id (the kit's argmax)
+-        ids = (ids + self.fw.vocab_lo).to(torch.int32)
++        vals, ids, k = P.rank_top(logits.float(), k, self.fw.vocab_lo, self.fw.vocab_wide)   # one k on every rank
+         packed = torch.cat([vals, ids.view(torch.float32)], 1).contiguous()
+         w = self.world
+         got = torch.empty((w * packed.numel(),), dtype=torch.float32, device=logits.device)
+@@ -323,6 +321,8 @@ class Dsv41Engine:
+         comm_mod.check(self.comm)           # a failed RoCE exchange raises before any token
+         values = torch.cat([g[r, :, :k] for r in range(w)], 1).numpy().astype(np.float32)
+         tokens = torch.cat([g[r, :, k:].contiguous().view(torch.int32) for r in range(w)], 1).numpy().astype(np.int64)
++        real = tokens[0] != P.PAD                   # a narrower slice's padding (the same columns in every row)
++        values, tokens = values[:, real], tokens[:, real]
+         if greedy:
+             order = np.lexsort((tokens, -values), axis=-1)
+             return [int(tokens[i, order[i, 0]]) for i in range(logits.shape[0])]
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/forward.py b/src/tensorfold/families/deepseek_v41/cuda/forward.py
+index 6a38fb1d1fc2a7d814017d74d2993b70fe366b37..7b4bb5925916cb11a2640926fe8109f0cae85e6e 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/forward.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/forward.py
+@@ -189,6 +189,7 @@ class Forward:
+         self.tables = tables(cfg, limit + self.pchunk, self.device)
+         self.embed, self.vocab_lo = tree.embed, tree.vocab_lo
+         self.vocab = int(cfg.vocab_size)
++        self.vocab_wide = P.widest(self.vocab, self.world)    # the widest rank's columns (top-k exchanges)
+         self.norm = tree.norm
+         self.head = B.materialize(tree.head, self.device)
+         self.blocks = [B.Block(cfg, lw, self.device, self.world) for lw in tree.layers]
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/gate.py b/src/tensorfold/families/deepseek_v41/cuda/gate.py
+index 204d9b83451db378b19d72195b9b0af517ad201b..b027d638c500a1de648c3ec54af698729e90b4ce 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/gate.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/gate.py
+@@ -87,16 +87,17 @@ class Scorer:
+         at = torch.where(ok, lg.gather(1, local.clamp(0, lg.shape[1] - 1)[:, None])[:, 0],
+                          torch.full_like(lse, float("-inf")))
+         packed = torch.cat([vals, ids.to(torch.float32), lse[:, None], at[:, None]], 1)
+-        g = self._gather(packed).cpu().double()
+-        v = torch.cat([g[0, :, :5], g[1, :, :5]], 1)
+-        t = torch.cat([g[0, :, 5:10], g[1, :, 5:10]], 1).long()
++        g = self._gather(packed).cpu().double()             # [W, R, 12]: every rank's slice, rank order
++        W = g.shape[0]
++        v = torch.cat([g[w, :, :5] for w in range(W)], 1)
++        t = torch.cat([g[w, :, 5:10] for w in range(W)], 1).long()
+         top5, top1 = [], []
+         for r in range(v.shape[0]):
+-            o = sorted(range(10), key=lambda j: (-float(v[r, j]), int(t[r, j])))
++            o = sorted(range(5 * W), key=lambda j: (-float(v[r, j]), int(t[r, j])))
+             top5.append([int(t[r, j]) for j in o[:5]])
+             top1.append(top5[-1][0])
+-        gl = torch.logaddexp(g[0, :, 10], g[1, :, 10])
+-        lp = torch.maximum(g[0, :, 11], g[1, :, 11]) - gl
++        gl = torch.logsumexp(g[:, :, 10], 0)
++        lp = g[:, :, 11].max(0).values - gl
+         return top1, top5, lp.tolist()
+ 
+ 
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/pick.py b/src/tensorfold/families/deepseek_v41/cuda/pick.py
+index 10cd14264230247e63f6f8e6894bf549ff5ca644..af3fb56bf29ab13074a1fbb7890947f50a944c62 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/pick.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/pick.py
+@@ -83,4 +83,35 @@ def kit_weights(w: torch.Tensor) -> torch.Tensor:
+     return w.to(torch.float16).to(w.dtype)
+ 
+ 
+-__all__ = ["argmax", "keys", "kit_logits", "kit_partial", "kit_weights", "top"]
++PAD = (1 << 31) - 1     # a padded candidate's id: after every real id (``vsample.ID_MAX``), never a token
++
++
++def widest(vocab: int, world: int) -> int:
++    """The widest rank's vocabulary columns (``weights.block_bounds``: rank 0 holds the extra 128-blocks)."""
++
++    if world <= 1:
++        return int(vocab)
++    from .weights import block_bounds
++
++    lo, hi = block_bounds(int(vocab), int(world), 0)
++    return hi - lo
++
++
++def rank_top(lg: torch.Tensor, count: int, lo: int, wide: int) -> tuple[torch.Tensor, torch.Tensor, int]:
++    """This rank's share of a top-``count`` exchange over the ranks' vocabulary slices: (values, int32 ids, k) with
++    the same ``k = min(count, wide)`` on every rank (``wide``: ``widest``), so the all-gather's sizes agree when the
++    slices are uneven (TP=4: 32,384 / 32,384 / 32,256 / 32,256). A narrower slice pads its rows with (-inf, ``PAD``),
++    which sort after every real candidate, -inf ones included; callers take at most the vocabulary's count."""
++
++    k = min(int(count), int(wide))
++    vals, ids = top(lg, k)
++    ids = (ids + lo).to(torch.int32)
++    short = k - vals.shape[-1]
++    if short > 0:
++        R = vals.shape[0]
++        vals = torch.cat([vals, torch.full((R, short), float("-inf"), dtype=vals.dtype, device=vals.device)], 1)
++        ids = torch.cat([ids, torch.full((R, short), PAD, dtype=torch.int32, device=ids.device)], 1)
++    return vals, ids, k
++
++
++__all__ = ["PAD", "argmax", "keys", "kit_logits", "kit_partial", "kit_weights", "rank_top", "top", "widest"]
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/planlink.py b/src/tensorfold/families/deepseek_v41/cuda/planlink.py
+index 5f41827c956f62e91a9730ce1f4ac4ece1e2efb2..0e0dc0ab2e04c3e702de9fc2825f82c7484d544a 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/planlink.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/planlink.py
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: MIT
+ # Copyright (c) 2026 Jay Leaton. The DeepSeek-V4.1-Flash family of TensorFold (Apache-2.0): see THIRD_PARTY_NOTICES.md.
+-"""The round plan from rank 0 to rank 1 over a TCP socket instead of the communicator (``TF_DSV41_PLAN_LINK=tcp``).
++"""The round plan from rank 0 to the followers over a TCP socket instead of the communicator (``TF_DSV41_PLAN_LINK=tcp``).
+ 
+ Why: ``engine._Link`` shares each plan with two all-gathers on the GPU stream (its length, then its ints), each
+ followed by a ``.tolist()``: ~0.74 ms of rank 0's host a round (G7 C1), and because the gathers queue behind
+@@ -14,6 +14,11 @@ while both GPUs still run. The plan is the same list of ints as before (``plan.P
+ order and rank 1's decisions are unchanged; a closed connection raises on both sides (rank 1 stops instead of
+ hanging in a collective).
+ 
++Who is who: a follower opens with a hello (``HELLO``: magic, its rank, the world size) and waits for rank 0's
++one-byte answer; rank 0 accepts until it holds ranks 1 .. world - 1 exactly once each, in rank order, and closes
++anything else (a stray client, a duplicate rank, another world size) without counting it. A refused follower
++raises at boot instead of following the wrong leader; rank 0 never pairs a plan stream with an unknown peer.
++
+ Knobs: TF_DSV41_PLAN_LINK (nccl: the communicator, default; tcp), TF_DSV41_PLAN_PORT, TF_DSV41_PLAN_TIMEOUT
+ (connect / accept seconds, 300).
+ """
+@@ -28,6 +33,9 @@ from array import array
+ 
+ ENV = "TF_DSV41_PLAN_LINK"
+ _LEN = struct.Struct("<I")
++HELLO = struct.Struct("<4sHH")     # b"TFPL", rank, world
++MAGIC = b"TFPL"
++OK, REFUSED = b"\x01", b"\x00"
+ 
+ 
+ def mode() -> str:
+@@ -70,23 +78,12 @@ class TcpLink:
+             srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+             srv.bind(("", int(port)))
+             srv.listen(max(1, self.world - 1))
+-            srv.settimeout(timeout_s)
+             try:
+-                for _ in range(self.world - 1):
+-                    conns.append(srv.accept()[0])
++                conns = self._accept(srv, time.monotonic() + timeout_s)
+             finally:
+                 srv.close()
+         else:
+-            end = time.monotonic() + timeout_s
+-            while True:
+-                try:
+-                    conn = socket.create_connection((host, int(port)), timeout=5.0)
+-                    break
+-                except OSError:
+-                    if time.monotonic() > end:
+-                        raise
+-                    time.sleep(0.05)
+-            conns.append(conn)
++            conns.append(self._join(host, int(port), time.monotonic() + timeout_s))
+         for conn in conns:
+             conn.settimeout(None)               # a follower may idle in recv for hours: no read deadline ...
+             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+@@ -94,6 +91,68 @@ class TcpLink:
+         self.conns = conns
+         self.conn = conns[0] if conns else None
+ 
++    def _accept(self, srv: socket.socket, end: float) -> list[socket.socket]:
++        """Rank 0: one connection a follower rank, identified by its hello, in rank order."""
++
++        got: dict[int, socket.socket] = {}
++        while len(got) < self.world - 1:
++            left = end - time.monotonic()
++            if left <= 0:
++                for c in got.values():
++                    c.close()
++                missing = sorted(set(range(1, self.world)) - set(got))
++                raise TimeoutError(f"plan link: rank(s) {missing} did not connect (TF_DSV41_PLAN_TIMEOUT)")
++            srv.settimeout(left)
++            try:
++                conn, addr = srv.accept()
++            except socket.timeout:
++                continue
++            why = None
++            try:
++                conn.settimeout(10.0)
++                magic, rank, world = HELLO.unpack(_read(conn, HELLO.size))
++                if magic != MAGIC:
++                    why = "not a plan link hello"
++                elif world != self.world:
++                    why = f"world {world}, this is world {self.world}"
++                elif not 0 < rank < self.world:
++                    why = f"rank {rank} outside 1 .. {self.world - 1}"
++                elif rank in got:
++                    why = f"rank {rank} is already connected"
++            except (OSError, ConnectionError, struct.error) as e:
++                why = f"no hello ({e})"
++            if why is not None:
++                print(f"[tensorfold] plan link: refused {addr[0]}: {why}", flush=True)
++                try:
++                    conn.sendall(REFUSED)
++                except OSError:
++                    pass
++                conn.close()
++                continue
++            conn.sendall(OK)
++            got[rank] = conn
++        return [got[r] for r in range(1, self.world)]
++
++    def _join(self, host: str, port: int, end: float) -> socket.socket:
++        """A follower: connect, say who it is, and wait for rank 0's yes."""
++
++        while True:
++            try:
++                conn = socket.create_connection((host, port), timeout=5.0)
++                break
++            except OSError:
++                if time.monotonic() > end:
++                    raise
++                time.sleep(0.05)
++        conn.settimeout(max(10.0, end - time.monotonic()))
++        conn.sendall(HELLO.pack(MAGIC, self.rank, self.world))
++        answer = _read(conn, 1)
++        if answer != OK:
++            conn.close()
++            raise ConnectionError(f"plan link: rank 0 at {host}:{port} refused rank {self.rank} of {self.world} "
++                                  "(a duplicate rank or a different world size; see rank 0's log)")
++        return conn
++
+     def send(self, plan) -> None:
+         body = array("q", plan).tobytes()
+         frame = _LEN.pack(len(body)) + body
+@@ -126,6 +185,16 @@ class TcpLink:
+                 pass
+ 
+ 
++def _read(conn: socket.socket, n: int) -> bytes:
++    buf = bytearray()
++    while len(buf) < n:
++        k = conn.recv(n - len(buf))
++        if not k:
++            raise ConnectionError("plan link: the peer closed the connection during the handshake")
++        buf += k
++    return bytes(buf)
++
++
+ def make(engine_link, rank: int, master: str, master_port: int, world: int = 2):
+     """The batcher's link: ``engine_link`` (the communicator's) unless TF_DSV41_PLAN_LINK=tcp."""
+ 
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/slots.py b/src/tensorfold/families/deepseek_v41/cuda/slots.py
+index 96c7770f477e1534795f430801f61c68048bec7f..9fb59eacc40b32c0480f784dbb5d0bb2bb380bc4 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/slots.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/slots.py
+@@ -249,9 +249,7 @@ class SlotsForward(Forward):
+                     allowed[a:a + n] = bits.reshape(n, -1)[:, :vl].bool()
+                 a += n
+             lg = lg.masked_fill(~allowed, float("-inf"))
+-        k = min(int(count), vl)
+-        vals, ids = P.top(lg, k)                    # ties: the lower id (the kit's argmax)
+-        ids = (ids + lo).to(torch.int32)
++        vals, ids, k = P.rank_top(lg, count, lo, self.vocab_wide)   # ties: the lower id; one k on every rank
+         packed = torch.cat([vals, ids.view(torch.float32)], 1).contiguous()
+         if self.world > 1:
+             got = torch.empty((self.world * packed.numel(),), dtype=torch.float32, device=packed.device)
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/stack.py b/src/tensorfold/families/deepseek_v41/cuda/stack.py
+index 9c4c44caaec9265465f251acd9028641b22ae43f..f9d604e6ac2edc7516f2c79d227e67b86d7b058f 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/stack.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/stack.py
+@@ -65,7 +65,7 @@ def build(fwd, topo, *, rank: int, link, model_dir, eos: Sequence[int], slots: i
+     store = None
+     if (os.environ.get("TF_DSV41_SESSIONS", "1").strip() or "1") != "0":
+         ident = sessdisk.compat_ident(image=image, knobs={k: os.environ.get(k, "") for k in BYTE_KNOBS},
+-                                      layout=compat_extra(tag, topo), extra={"page": pool.page})
++                                      layout=compat_extra(tag, topo), extra={"page": pool.page, "world": int(getattr(fwd, "world", 1))})  # TP=2 / TP=4 bytes differ
+         disk = sessdisk.from_env(rank, ident)
+         store = Store(pool, ram_bytes=int(os.environ.get("TF_DSV41_SESSION_RAM_MIB", "256") or 256) << 20, disk=disk)
+     host = Host(model_dir, topo.vocab, eos, quiet=quiet or rank != 0)
+diff --git a/tests/dsv41_fakes.py b/tests/dsv41_fakes.py
+index ca89c7994dd125322a540d913d82f87e64459001..9df8911e832b05ff5b5a00758ce5be5257815182 100644
+--- a/tests/dsv41_fakes.py
++++ b/tests/dsv41_fakes.py
+@@ -231,6 +231,9 @@ class _ThreadComm:
+         p = self.pair
+         p.slots[self.rank] = send.reshape(-1).clone()
+         p.bar.wait()
++        sizes = [int(x.numel()) for x in p.slots]
++        if len(set(sizes)) != 1:        # NCCL's contract: every rank sends the same count (else a hang or garbage)
++            raise RuntimeError(f"all_gather: ranks sent {sizes} elements")
+         recv.copy_(torch.cat(p.slots))
+         p.bar.wait()
+ 
+diff --git a/tests/test_dsv41_four_sparks.py b/tests/test_dsv41_four_sparks.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c19c9206a3e30cc534bc678651e39c833d86f8b4
+--- /dev/null
++++ b/tests/test_dsv41_four_sparks.py
+@@ -0,0 +1,332 @@
++# SPDX-License-Identifier: MIT
++"""Four ranks with uneven slices: the bugs jayleaton's review of the TP=4 port found (PR #6), each pinned here.
++
++- candidates over the vocabulary at any count (verify windows, nucleus rows' full vocabulary, DSpark): every rank
++  sends the same k (``pick.rank_top``: the widest slice's, narrower ones padded), so the all-gather agrees and the
++  merged rows equal one rank's (before: ``k = min(count, own width)``, a mismatched gather at count > 32,256);
++- the trimmed draft head's per-rank lists follow the 128-block vocabulary split (before: ``r * n``, rank 2 refused
++  to boot) and four ranks draft alike, greedy, sampled and nucleus (full-vocabulary candidates) requests;
++- the TCP plan link: followers say who they are; rank 0 refuses strays, duplicates and another world size, and
++  orders the connections by rank;
++- ``--tp 4`` only for a family that declares it (``CUDA_TP``);
++- ``TF_DSV41_PREFILL_ATTN_BMQ=32`` on a rank with 16 heads runs the fused kernel with 16 heads a program;
++- the NVMe session tier's directory differs between world sizes;
++- a DSpark delta's shards follow the weights' 128-block split.
++
++The thread communicator now refuses unequal all-gather sizes (NCCL's contract), so a mismatch fails here instead of
++hanging a Spark.
++"""
++
++from __future__ import annotations
++
++import queue
++import socket
++import threading
++
++import numpy as np
++import pytest
++
++torch = pytest.importorskip("torch")
++pytestmark = pytest.mark.torch
++
++import dsv41_dspark_fakes as DF  # noqa: E402
++import dsv41_fakes as FK  # noqa: E402
++
++from tensorfold.engine.exact_sampling import Sampling  # noqa: E402
++from tensorfold.families.deepseek_v41.cuda import numerics as N  # noqa: E402
++from tensorfold.families.deepseek_v41.cuda import pick as P  # noqa: E402
++from tensorfold.families.deepseek_v41.cuda import planlink as PL  # noqa: E402
++from tensorfold.families.deepseek_v41.cuda import vsample as VS  # noqa: E402
++from tensorfold.families.deepseek_v41.cuda.batch import Job  # noqa: E402
++from tensorfold.families.deepseek_v41.cuda.weights import block_bounds  # noqa: E402
++
++V4 = {"vocab_size": 640, "o_groups": 4, "moe_intermediate_size": 640}      # slices 256 / 128 / 128 / 128
++PROMPTS = [[int(t) for t in np.random.default_rng(70 + i).integers(3, 600, size=30 + 11 * i)] for i in range(3)]
++GREEDY, TOPK = None, Sampling(seed=7, temperature=0.8, top_k=20, top_p=0.95)
++NUCLEUS = Sampling(seed=11, temperature=1.1, top_k=0, top_p=0.9, min_p=0.02)    # full-vocabulary rows
++
++
++# -- candidates over uneven slices -----------------------------------------------------------------------------------
++def slices(V: int, W: int):
++    return [block_bounds(V, W, r) for r in range(W)]
++
++
++@pytest.mark.parametrize("count", [1, 5, 128, 129, 200, 256, 640])
++def test_rank_top_merges_to_the_whole_vocabulary(count):
++    V, W = 640, 4
++    g = torch.Generator().manual_seed(3)
++    lg = torch.randn((6, V), generator=g).to(torch.bfloat16).float()
++    lg[:, ::7] = lg[:, :1]                                  # ties across slices: the lower id first
++    lg[2, 100:300] = float("-inf")                          # masked tokens stay real candidates
++    wide = P.widest(V, W)
++    assert wide == 256
++    parts = [P.rank_top(lg[:, lo:hi], count, lo, wide) for lo, hi in slices(V, W)]
++    assert len({k for _, _, k in parts}) == 1               # one k: the gather's sizes agree
++    k = parts[0][2]
++    packed = [torch.cat([v, i.view(torch.float32)], 1) for v, i, _ in parts]
++    vals, ids = VS.merge(torch.stack(packed), k, count)
++    want_v, want_i = P.top(lg, count)
++    assert torch.equal(ids, want_i.to(torch.int64))
++    assert torch.equal(vals, want_v)
++    assert int(ids.max()) < V                               # never a pad
++
++
++def test_engine_choose_drops_the_padding():
++    """``engine.choose``'s host merge (greedy and sampled) sees real ids only."""
++
++    V, W = 640, 4
++    lg = torch.randn((3, V), generator=torch.Generator().manual_seed(9)).to(torch.bfloat16).float()
++    parts = [P.rank_top(lg[:, lo:hi], 300, lo, P.widest(V, W)) for lo, hi in slices(V, W)]
++    tokens = torch.cat([i for _, i, _ in parts], 1).numpy().astype(np.int64)
++    assert (tokens == P.PAD).any()
++    real = tokens[0] != P.PAD
++    assert all(((t == P.PAD) == ~real).all() for t in tokens)      # the same columns in every row
++    assert real.sum() == V
++
++
++@pytest.fixture(scope="module")
++def ck4(tmp_path_factory):
++    return DF.ckpt(tmp_path_factory.mktemp("dsv41tp4ds"), **V4)
++
++
++@pytest.fixture(scope="module")
++def ranking(tmp_path_factory):
++    f = tmp_path_factory.mktemp("dsv41rk") / "rank.txt"
++    f.write_text("# test ranking\n" + " ".join(map(str, list(range(1, 640, 2)) + list(range(0, 640, 2)))) + "\n")
++    return str(f)
++
++
++def test_candidates_full_vocabulary_on_four_ranks(ck4):
++    """A verify window's candidates at counts past the narrow slices (nucleus rows ask for the whole vocabulary)."""
++
++    from tensorfold.families.deepseek_v41.cuda.forward import Seg
++
++    ids = PROMPTS[0][:20]
++    pair = FK.ThreadPair(4)
++    comms = pair.comms()
++
++    def go(r):
++        f = DF.forward(ck4, rank=r, world=4, comm=comms[r], dspark=False)
++        lg = f.run([Seg(0, 0, tuple(ids))])
++        return [f.candidates(lg, [len(ids)], c) for c in (3, 200, 640)]
++
++    with N.exact():
++        got = pair.run([lambda r=r: go(r) for r in range(4)])
++        one = DF.forward(ck4, dspark=False)
++        lg1 = one.run([Seg(0, 0, tuple(ids))])
++        want = [one.candidates(lg1, [len(ids)], c) for c in (3, 200, 640)]
++    for rank in got:
++        for c, w in zip(rank, want):
++            assert np.array_equal(np.asarray(c.ids), np.asarray(w.ids))
++            assert np.allclose(np.asarray(c.values, dtype=np.float64), np.asarray(w.values, dtype=np.float64),
++                               rtol=0, atol=1e-9)
++    assert np.asarray(got[0][2].ids).shape[1] == 640
++
++
++class Fanout:
++    """Rank 0's plan to every follower (the batcher's ``Link``)."""
++
++    def __init__(self, world: int) -> None:
++        self.q = [queue.Queue() for _ in range(world)]
++
++    def sender(self):
++        outer = self
++
++        class S:
++            def send(self, plan):
++                for q in outer.q[1:]:
++                    q.put(list(plan))
++
++        return S()
++
++    def receiver(self, r: int):
++        q = self.q[r]
++
++        class R:
++            def recv(self):
++                return q.get(timeout=300)
++
++        return R()
++
++
++def test_four_ranks_trimmed_head_draft_alike(ck4, ranking, monkeypatch):
++    for k, v in {"TF_DSV41_DRAFT_HEAD": "trim:64", "TF_DSV41_DRAFT_VOCAB_FALLBACK": "off",
++                 "TF_DSV41_DRAFT_VOCAB": ranking}.items():
++        monkeypatch.setenv(k, v)
++    pair = FK.ThreadPair(4)
++    comms = pair.comms()
++    fws = pair.run([lambda r=r: DF.forward(ck4, slots=3, rank=r, world=4, comm=comms[r]) for r in range(4)])
++    heads = [f.drafter.head for f in fws]
++    assert [len(h.ids) for h in heads] == [64] * 4
++    for (lo, hi), h in zip(slices(640, 4), heads):
++        assert lo <= int(h.ids.min()) and int(h.ids.max()) < hi      # each rank lists its own slice
++    link = Fanout(4)
++    bs = [DF.batcher(ck4, fws[0], n=3, link=link.sender(), rank=0)]
++    bs += [DF.batcher(ck4, fws[r], n=3, link=link.receiver(r), rank=r) for r in range(1, 4)]
++    ts = [threading.Thread(target=b.follow, daemon=True) for b in bs[1:]]
++    for t in ts:
++        t.start()
++    got = DF.run(bs[0], [Job(list(PROMPTS[0]), 10, GREEDY), Job(list(PROMPTS[1]), 10, TOPK),
++                         Job(list(PROMPTS[2]), 10, NUCLEUS)])
++    bs[0].send_stop()
++    for t in ts:
++        t.join(timeout=300)
++        assert not t.is_alive()
++    assert all(len(g) == 10 for g in got)
++    assert all(0 <= t < 640 for g in got for t in g)
++
++
++def test_four_ranks_full_head_equal_one_rank(ck4, monkeypatch):
++    """Greedy, top-k and nucleus decoding on four ranks == one rank, token for token (exact numerics)."""
++
++    monkeypatch.delenv("TF_DSV41_DRAFT_HEAD", raising=False)
++    jobs = [(PROMPTS[0], 8, GREEDY), (PROMPTS[1], 8, TOPK), (PROMPTS[2], 8, NUCLEUS)]
++    with N.exact():
++        one = DF.run(DF.batcher(ck4, DF.forward(ck4, slots=3), n=3), [Job(list(p), n, s) for p, n, s in jobs])
++        pair = FK.ThreadPair(4)
++        comms = pair.comms()
++        fws = pair.run([lambda r=r: DF.forward(ck4, slots=3, rank=r, world=4, comm=comms[r]) for r in range(4)])
++        link = Fanout(4)
++        bs = [DF.batcher(ck4, fws[0], n=3, link=link.sender(), rank=0)]
++        bs += [DF.batcher(ck4, fws[r], n=3, link=link.receiver(r), rank=r) for r in range(1, 4)]
++        ts = [threading.Thread(target=b.follow, daemon=True) for b in bs[1:]]
++        for t in ts:
++            t.start()
++        four = DF.run(bs[0], [Job(list(p), n, s) for p, n, s in jobs])
++        bs[0].send_stop()
++        for t in ts:
++            t.join(timeout=300)
++    assert four == one
++
++
++# -- the TCP plan link -------------------------------------------------------------------------------------------
++def free_port() -> int:
++    with socket.socket() as s:
++        s.bind(("127.0.0.1", 0))
++        return s.getsockname()[1]
++
++
++def link_world(world: int, port: int, order, before=None, timeout: float = 20.0):
++    """Rank 0 and the followers ``order`` (ranks; connected in that order) on threads; ``before``: run first."""
++
++    out, err = {}, {}
++
++    def lead():
++        try:
++            out[0] = PL.TcpLink(0, "127.0.0.1", port, timeout_s=timeout, world=world)
++        except BaseException as e:      # noqa: BLE001
++            err[0] = e
++
++    def follow(r, w=world):
++        try:
++            out[r] = PL.TcpLink(r, "127.0.0.1", port, timeout_s=timeout, world=w)
++        except BaseException as e:      # noqa: BLE001
++            err[r] = e
++
++    t0 = threading.Thread(target=lead)
++    t0.start()
++    if before is not None:
++        before()
++    ts = []
++    for r in order:
++        t = threading.Thread(target=follow, args=r if isinstance(r, tuple) else (r,))
++        t.start()
++        t.join(timeout=timeout)
++        ts.append(t)
++    t0.join(timeout=timeout + 5)
++    return out, err
++
++
++def test_plan_link_four_ranks_in_rank_order():
++    port = free_port()
++    out, err = link_world(4, port, [3, 1, 2])
++    assert not err
++    lead = out[0]
++    lead.send([7, 8, 9])
++    for r in (1, 2, 3):
++        assert out[r].recv() == [7, 8, 9]
++    peers = [c.getpeername()[1] for c in lead.conns]
++    mine = [out[r].conn.getsockname()[1] for r in (1, 2, 3)]
++    assert peers == mine                                    # conns[i] is rank i + 1
++    for v in out.values():
++        v.close()
++
++
++def test_plan_link_refuses_strays_duplicates_and_other_worlds():
++    port = free_port()
++
++    def stray():
++        import time
++
++        for _ in range(200):
++            try:
++                s = socket.create_connection(("127.0.0.1", port), timeout=1)
++                break
++            except OSError:
++                time.sleep(0.02)
++        s.sendall(b"GET / HTTP/1.0\r\n\r\n")                # a port scanner / a web client
++        assert s.recv(1) in (PL.REFUSED, b"")
++        s.close()
++
++    out, err = link_world(4, port, [1, (2, 2), 1, 2, 3], before=stray)
++    # refused: rank 2 of a world of 2, then a second rank 1; then ranks 2 and 3 join
++    assert set(err) == {1, 2} and all(isinstance(e, ConnectionError) for e in err.values())
++    assert set(out) == {0, 1, 2, 3}
++    out[0].send([1])
++    assert [out[r].recv() for r in (1, 2, 3)] == [[1], [1], [1]]
++    for v in out.values():
++        v.close()
++
++
++def test_plan_link_names_the_missing_rank():
++    port = free_port()
++    out, err = link_world(4, port, [1, 3], timeout=2.0)
++    assert isinstance(err.get(0), TimeoutError) and "[2]" in str(err[0])
++
++
++# -- CLI, BMQ, session tier, DSpark delta ------------------------------------------------------------------------
++def test_tp4_only_for_families_that_declare_it(monkeypatch):
++    import argparse
++    import types
++
++    from tensorfold import cli
++
++    fam = types.SimpleNamespace(title="Other", package=types.SimpleNamespace())
++    args = argparse.Namespace(tp=4, rank=0, master="10.0.0.1")
++    with pytest.raises(ValueError, match="--tp 4: Other runs with --tp 1 / 2"):
++        cli._serve_cuda(args, fam, None)
++    from tensorfold.families import deepseek_v41
++
++    assert 4 in deepseek_v41.CUDA_TP
++
++
++def test_bmq_32_clamps_to_16_heads(monkeypatch):
++    from tensorfold.families.deepseek_v41.cuda.csa2 import attn_pf
++
++    monkeypatch.setenv("TF_DSV41_PREFILL_ATTN_BMQ", "32")
++    assert attn_pf.config(64)[0] == 32 and attn_pf.config(32)[0] == 32     # TP=2, the pipeline's stages
++    assert attn_pf.config(16)[0] == 16                                      # TP=4
++    assert attn_pf.config(8)[0] == 32                                       # synthetic: chunk kernels (backend)
++
++
++def test_session_tier_directory_depends_on_world(tmp_path):
++    from tensorfold.families.deepseek_v41.cuda import sessdisk
++
++    a = sessdisk.compat_hash(sessdisk.compat_ident(image="x", knobs={}, layout={}, extra={"page": 256, "world": 2}))
++    b = sessdisk.compat_hash(sessdisk.compat_ident(image="x", knobs={}, layout={}, extra={"page": 256, "world": 4}))
++    assert a != b
++    src = __import__("inspect").getsource(__import__("tensorfold.families.deepseek_v41.cuda.stack",
++                                                     fromlist=["build"]).build)
++    assert '"world"' in src
++
++
++def test_dspark_delta_shards_follow_the_block_split():
++    from tensorfold.families.deepseek_v41.cuda import dsparkdelta as DD
++
++    A, B = torch.randn(8, 2304), torch.randn(2304, 8)
++    parts = [DD.shard("col", A, B, r, 4)[1] for r in range(4)]
++    assert [p.shape[0] for p in parts] == [640, 640, 512, 512]
++    assert torch.equal(torch.cat(parts), B)
++    rows = [DD.shard("row", A, B, r, 4)[0] for r in range(4)]
++    assert torch.equal(torch.cat(rows, 1), A)
++    assert [DD.shard("col", A, torch.randn(1024, 8), r, 2)[1].shape[0] for r in range(2)] == [512, 512]
+-- 
+2.43.0
+

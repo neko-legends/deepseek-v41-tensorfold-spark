@@ -1,4 +1,5 @@
-# TensorFold serving DeepSeek-V4.1-Flash on two DGX Sparks (GB10, sm_121, aarch64).
+# TensorFold serving DeepSeek-V4.1-Flash on four DGX Sparks (GB10, sm_121, aarch64); the same image runs two.
+# Four Sparks: docker build -f docker/Dockerfile -t dsv41-tensorfold:tp4 . && bash scripts/serve4.sh ship (README.md).
 #
 # Base: NVIDIA's PyTorch container (CUDA toolkit, PyTorch, Triton). TensorFold comes from the pinned submodule
 # (vendor/TensorFold = v0.6.0) with the patches in patches/ applied in order, so the image is reproducible from this repo.

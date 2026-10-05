@@ -1,5 +1,9 @@
 # Four DGX Sparks (TP=4)
 
+> 2026-10-05: prompt reading is now pipelined across the four ranks (`patches/0004`, [PREFILL_SPEED.md](PREFILL_SPEED.md):
+> cold 160k 99.8 s -> 39 s), and `patches/0005` fixes the uneven-slice bugs jayleaton's review found
+> ([README](../README.md#fixed-in-0005-2026-10-05)). The tables below are the 2026-10-04 measurement of 0003 alone.
+
 The same engine on four GB10s instead of two: `patches/0003-four-sparks.patch` on top of 0001 and 0002,
 `scripts/serve4.sh` to run the four ranks, `config/tp4.env.example` for the overrides. Same EXL3 2.9 bpw pack, same
 exact speculative decoding (drafted == serial), same OpenAI / DSML / structured-output server.
@@ -36,7 +40,7 @@ uneven vocabulary slices, Engram from `of4` shards, the partition rules). The ex
 
 ## 2. Setup
 
-Prerequisites beyond the two-Spark recipe: four nodes with one switched IPv4 subnet per CX7 port function, passwordless
+Prerequisites beyond the two-Spark recipe ([TWO_SPARKS.md](TWO_SPARKS.md)): four nodes with one switched IPv4 subnet per CX7 port function, passwordless
 ssh from the head to the three workers over the link, the pack and the base checkpoint's Engram source on each node.
 
 ```bash
@@ -61,7 +65,8 @@ bash scripts/serve4.sh status | logs [R] | stop
 
 Optional: `scripts/keeper4.sh` from cron restarts the four ranks after a reboot or three failed health checks.
 
-Lessons from the first boot: give every rank the same `TF_DSV41_PREFILL_ATTN_BMQ=16` (16 heads a rank); list both CX7
+Lessons from the first boot: give every rank the same `TF_DSV41_PREFILL_ATTN_BMQ=16` (16 heads a rank; since 0005 a
+32 is clamped to 16 on its own); list both CX7
 functions in `NCCL_IB_HCA` (prompt segments over NCCL: 2.9 ms instead of 5.6 ms per 2,048-row all-gather); a node with
 an unplugged port holding an address on the link subnet can drop TCP to it (use the other subnet for ssh / NCCL
 sockets).
@@ -78,14 +83,16 @@ cold on both servers). Decode rate: (completion tokens - 1) / (last content even
 
 | prompt | TP=4 prose | SGLang prose | TP=4 code | SGLang code | TP=4 cold TTFT | SGLang cold TTFT |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1k | **63.6** | 37.7 | **104.9** | 62.2 | 0.3-0.8 s | 0.5 s |
+| 1k | **63.6** | 37.7 | **104.9** | 62.2 | - (warm, see below) | 0.5 s |
 | 20k | **65.7** | 38.0 | **97.0** | 56.9 | 12.9-14.2 s | **5.3-5.5 s** |
 | 40k | **64.0** | 38.1 | **96.4** | 53.8 | 24.5-24.7 s | **10.7-10.8 s** |
 | 80k | **62.8** | 37.1 | **103.1** | 59.9 | 45.9-46.8 s | **22.0 s** |
 | 160k | **61.0** | 38.3 | **99.8** | 54.6 | 97.4-99.8 s | **48.1-52.1 s** |
 | geometric mean | **63.4** | 37.8 | **100.2** | 57.4 | | |
 
-Decode: 1.68x (prose) and 1.75x (code). Cold prompt reading is about 2.1x slower than SGLang's (below). Warm repeats
+The 1k row's first trial was not a cold read: the bench's warm-up request was the first 1k fixture itself, so the
+session cache already held it (0.3-0.8 s); it has no cold time here (correction, 2026-10-05; the warm-up is now a
+separate 300-token prompt). Decode: 1.68x (prose) and 1.75x (code). Cold prompt reading is about 2.1x slower than SGLang's (below). Warm repeats
 reuse the prefix: 0.26-0.64 s to the first token at every depth.
 
 ### Short prompts, concurrency, gates
@@ -106,9 +113,12 @@ own prompts (different prompts: not a like-for-like row).
 
 A profiled 2,048-row prompt segment (rank 0) is GPU-bound: ~1.19 s, the GPU busy 95% of it, of which ~0.40 s is 43
 NCCL all-gathers of bf16 partials (~3.1 ms each: each rank receives three peers' 21 MB) and ~0.73 s compute. At two
-ranks a segment moves a third of those bytes but computes twice as much, which is why TP=4 prefill is only slightly
-faster than TP=2. The next lever is overlapping the segment exchanges with compute (two micro-batches a segment);
-a reduce-scatter that keeps the rank-order sum exactly saves only ~25% of the bytes.
+ranks a segment moves a third of those bytes but computes twice as much, and much of a layer (the indexer's heads and
+top-512 selection, the compressor, the single KV head, the mHC streams) is not split at all, so every rank computes it
+in full. Correction (2026-10-05, from jayleaton's review): this left TP=4 prompt reading **~15-25% slower than two
+Sparks**, not "slightly faster" as first written here (two-Spark row: 1,953 tokens/s at 128K; TP=4 0003: ~1,600 at
+160k). Overlapping the exchanges recovered ~10%; reading prompts as a pipeline across the ranks recovered the rest and
+more (~4,100 tokens/s at 160k): [PREFILL_SPEED.md](PREFILL_SPEED.md).
 
 ## 4. Comparing
 

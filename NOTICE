@@ -5,6 +5,14 @@ This project's own code, scripts, benchmarks and documentation are licensed unde
 Version 2.0 (see LICENSE). If you redistribute this project or a modified version of it, keep this NOTICE
 file and the copyright line above, and state what you changed (Apache-2.0, section 4).
 
+Four-Spark fork (https://github.com/neko-legends/deepseek-v41-tensorfold-spark)
+  Changes made in this fork, 2026-10-04 onward, under the same Apache License 2.0 (Apache-2.0, section 4(b)):
+  patches/0003-four-sparks.patch, patches/0004-prefill-speed.patch and patches/0005-four-spark-fixes.patch (new
+  engine changes on top of 0001 and 0002; the files they add carry their own SPDX notice), scripts/serve4.sh,
+  scripts/keeper4.sh, config/tp4.env.example, docs/FOUR_SPARKS.md, docs/PREFILL_SPEED.md, results/four-sparks-20261004/,
+  results/prefill-speed-20261005/, a new README.md (the original moved to docs/TWO_SPARKS.md with a note and adjusted
+  links), and comments in docker/Dockerfile and config/. Everything else is jayleaton's repository unchanged.
+
 This project builds on third-party work that keeps its own license:
 
 TensorFold

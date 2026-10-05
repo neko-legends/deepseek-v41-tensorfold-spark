@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Claude <noreply@anthropic.com>
+From: neko-legends <neko-legends@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 05:30:00 -0700
 Subject: [PATCH] deepseek_v41: faster prompt reading on four Sparks
 
@@ -26,7 +26,6 @@ Subject: [PATCH] deepseek_v41: faster prompt reading on four Sparks
   state in exact numerics: W = 2 and 4, a snapshot mid-prompt, p2p).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01WAyL9TFbTLwjeNsrEKfKAF
 ---
  src/tensorfold/cuda/comm.py                       |  24 +
  .../families/deepseek_v41/cuda/blocks.py          |  19 +-
