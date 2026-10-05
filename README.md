@@ -114,7 +114,8 @@ Setup notes and lessons from the first boots: [docs/FOUR_SPARKS.md](docs/FOUR_SP
 
 OpenAI-compatible on `HOST:PORT` (`127.0.0.1:8000` by default: put your own proxy and authentication in front):
 `/v1/chat/completions` (streaming, tool calls, `response_format`), `/v1/completions` (text or token ids),
-`/tokenize`, `/v1/models`, `/health`, `/metrics`. Thinking follows DeepSeek-V4.1's encoding and is on by default
+`/tokenize`, `/v1/models`, `/health`, `/metrics` (TensorFold's own series and, since 0006, the vLLM-named ones
+fleet dashboards read), `/v1/model_info` (`max_num_seqs`: the request slots). Thinking follows DeepSeek-V4.1's encoding and is on by default
 (`TF_DSV41_THINKING=0` turns it off); `reasoning_effort` `none` / `low` / `medium` / `high` / `max` or 1-100. The
 full table: [docs/TWO_SPARKS.md#api](docs/TWO_SPARKS.md#api) (unchanged at four Sparks).
 
@@ -129,6 +130,7 @@ full table: [docs/TWO_SPARKS.md#api](docs/TWO_SPARKS.md#api) (unchanged at four 
 | [`0003-four-sparks.patch`](patches/0003-four-sparks.patch) | this fork | TP=4: whole-block uneven splits, `--tp 4 --rank 0..3`, N-way rank agreement and plan link, RoCE post rotation, `/health` draft counters, sync-free expert counts, opt-in prefill profile |
 | [`0004-prefill-speed.patch`](patches/0004-prefill-speed.patch) | this fork | pipelined prompt reading across the four ranks, split selections, overlapped exchanges (all opt-in; on in `tp4.env.example`) |
 | [`0005-four-spark-fixes.patch`](patches/0005-four-spark-fixes.patch) | this fork | the uneven-slice bugs jayleaton's review of the TP=4 port found (below) |
+| [`0006-vllm-metrics.patch`](patches/0006-vllm-metrics.patch) | this fork | vLLM-named series on `/metrics` (requests running / waiting, token and finish counters) and `GET /v1/model_info` (`max_num_seqs`, `max_model_len`), so dashboards and routers built for vLLM see the 4 request slots instead of assuming 1 |
 
 ### Fixed in 0005 (2026-10-05)
 
@@ -174,7 +176,7 @@ The fixes:
 
 Every number and claim on this page was checked these ways before `main` moved to it.
 
-**1. The patches rebuild the engine exactly.** TensorFold v0.6.0 (`vendor/TensorFold`) with `patches/0001`-`0005`
+**1. The patches rebuild the engine exactly.** TensorFold v0.6.0 (`vendor/TensorFold`) with `patches/0001`-`0006`
 applied in order gives the same tree, file for file, as the engine branch the work was done on:
 
 ```bash
