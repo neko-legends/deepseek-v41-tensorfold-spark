@@ -21,6 +21,10 @@ Subject: [PATCH] deepseek_v41: four-Spark fixes from the TP=4 review (uneven
 - attn_pf: BMQ 32 on a rank with 16 heads runs with 16 heads a program
   (was: a silent fallback to the chunk kernels)
 - NVMe session tier: the world size is part of the compat ident
+- speculative DSpark pass: skipped after windows of more than
+  TF_DSV41_SPEC_MAX_COUNT (4,096) candidates a row; a sampled request with
+  top_k ~32,000 hung every rank in the candidates' wait with it on (found
+  while testing the above on four Sparks; the same requests pass without it)
 - gate scorer: any rank count (was two); DSpark delta shards follow the
   128-block split
 - tests: test_dsv41_four_sparks.py; the thread communicator refuses unequal
@@ -32,6 +36,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../families/deepseek_v41/__init__.py         |   1 +
  .../deepseek_v41/cuda/csa2/attn_pf.py         |  10 +-
  .../deepseek_v41/cuda/csa2/backend.py         |   9 +-
+ .../families/deepseek_v41/cuda/decode.py      |   7 +
  .../families/deepseek_v41/cuda/draft_head.py  |  15 +-
  .../families/deepseek_v41/cuda/dsparkdelta.py |  17 +-
  .../families/deepseek_v41/cuda/engine.py      |   6 +-
@@ -42,8 +47,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../families/deepseek_v41/cuda/slots.py       |   4 +-
  .../families/deepseek_v41/cuda/stack.py       |   2 +-
  tests/dsv41_fakes.py                          |   3 +
- tests/test_dsv41_four_sparks.py               | 332 ++++++++++++++++++
- 15 files changed, 502 insertions(+), 44 deletions(-)
+ tests/test_dsv41_four_sparks.py               | 361 ++++++++++++++++++
+ 16 files changed, 538 insertions(+), 44 deletions(-)
  create mode 100644 tests/test_dsv41_four_sparks.py
 
 diff --git a/src/tensorfold/cli.py b/src/tensorfold/cli.py
@@ -135,6 +140,31 @@ index e685631e09dd21d6eec68777a34186bb8fd5e1a1..0000c798ee589ca53eff031315b4e5d6
              from . import attn_pf
  
              return attn_pf.attention(q, rows, sel, counts, swa.kernel(), lo, win.t, sink, table.cs, out, ring=ring,
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/decode.py b/src/tensorfold/families/deepseek_v41/cuda/decode.py
+index 2c512ba574cc641d5928aebc15b7c8bfe0f92c85..2a3900f58ed8667583b30b9074c75393712c6119 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/decode.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/decode.py
+@@ -49,6 +49,12 @@ def dspark_enabled() -> bool:
+     return (os.environ.get("TF_DSV41_DSPARK", "1").strip() or "1") != "0"
+ 
+ 
++# The speculative DSpark pass (``spec.py``) only after windows of at most this many candidates a row. A sampled
++# request with top_k ~32,000 and the pass on hung every rank in the candidates' wait (2026-10-05, four Sparks; the
++# same requests pass with TF_DSV41_SPEC_DRAFT=0): such rows skip the speculation, which saves ~4 ms a round at most.
++SPEC_MAX_COUNT = int(os.environ.get("TF_DSV41_SPEC_MAX_COUNT", "") or 4096)
++
++
+ class LazyEngram:
+     """A window's Engram inputs, gathered a layer at a time when the forward first asks for it (``rows[L]``), so the
+     reads of layer 14 finish behind the launches of layers 0-13. ``items()`` gathers them all (graph staging). Both
+@@ -331,6 +337,7 @@ class DecodeForward(SlotsForward):
+             got = self.cand_fetch(g, k, count)          # the candidates' D2H copy is queued before the pass
+             if self.spec is not None:
+                 plain = not (masks is not None and any(m is not None for m in masks)) and not (nucleus and any(nucleus))
++                plain = plain and count <= SPEC_MAX_COUNT   # wide rows (top_k in the tens of thousands): no speculation
+                 with PH("spec"):
+                     if spec and plain:
+                         self.spec.launch(windows, spec, got)
 diff --git a/src/tensorfold/families/deepseek_v41/cuda/draft_head.py b/src/tensorfold/families/deepseek_v41/cuda/draft_head.py
 index 1f17989b3da01bd18e571570abcbeb978f4908e6..606871b1e36ba119766ec3e245e9e38c40fe04b4 100644
 --- a/src/tensorfold/families/deepseek_v41/cuda/draft_head.py
@@ -487,10 +517,10 @@ index ca89c7994dd125322a540d913d82f87e64459001..9df8911e832b05ff5b5a00758ce5be52
  
 diff --git a/tests/test_dsv41_four_sparks.py b/tests/test_dsv41_four_sparks.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..c19c9206a3e30cc534bc678651e39c833d86f8b4
+index 0000000000000000000000000000000000000000..46e3446a8f68cf34b029c7ad950e788708a053bb
 --- /dev/null
 +++ b/tests/test_dsv41_four_sparks.py
-@@ -0,0 +1,332 @@
+@@ -0,0 +1,361 @@
 +# SPDX-License-Identifier: MIT
 +"""Four ranks with uneven slices: the bugs jayleaton's review of the TP=4 port found (PR #6), each pinned here.
 +
@@ -823,6 +853,35 @@ index 0000000000000000000000000000000000000000..c19c9206a3e30cc534bc678651e39c83
 +    rows = [DD.shard("row", A, B, r, 4)[0] for r in range(4)]
 +    assert torch.equal(torch.cat(rows, 1), A)
 +    assert [DD.shard("col", A, torch.randn(1024, 8), r, 2)[1].shape[0] for r in range(2)] == [512, 512]
++
++
++def test_wide_candidate_rows_skip_the_speculative_pass(ck4, monkeypatch):
++    """``TF_DSV41_SPEC_DRAFT=1``: windows of more than ``SPEC_MAX_COUNT`` candidates a row launch no speculative
++    DSpark pass (top_k ~32,000 hung every rank with it on); narrower ones still do; replies are the same either way."""
++
++    from tensorfold.families.deepseek_v41.cuda import decode as DEC
++
++    monkeypatch.setenv("TF_DSV41_SPEC_DRAFT", "1")
++    monkeypatch.delenv("TF_DSV41_DRAFT_HEAD", raising=False)
++    wide = Sampling(seed=5, temperature=0.9, top_k=300)            # count 308 > the limit below
++    narrow = Sampling(seed=5, temperature=0.9, top_k=20)
++
++    def go(sampling, limit):
++        monkeypatch.setattr(DEC, "SPEC_MAX_COUNT", limit)
++        fw = DF.forward(ck4, slots=1)
++        assert fw.spec is not None
++        launched = []
++        real = fw.spec.launch
++        fw.spec.launch = lambda *a, **k: launched.append(1) or real(*a, **k)
++        got = DF.run(DF.batcher(ck4, fw, n=1), [Job(list(PROMPTS[0]), 12, sampling)])
++        return got, len(launched)
++
++    with N.exact():
++        skipped, n0 = go(wide, 64)
++        allowed, n1 = go(wide, 4096)
++        _, n2 = go(narrow, 64)
++    assert n0 == 0 and n1 > 0 and n2 > 0
++    assert skipped == allowed
 -- 
 2.43.0
 
