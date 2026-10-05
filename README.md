@@ -149,11 +149,11 @@ bugs that only uneven slices or more than two ranks expose. All fixed, each with
   attention with 16 heads a program instead of silently falling back to the chunk kernels.
 - **NVMe session tier**: the world size is part of the directory's identity, so an entry written by two Sparks is
   never resumed by four.
-- **Very wide sampled requests** (found while testing the above on the four Sparks): with the speculative DSpark
-  pass on (`TF_DSV41_SPEC_DRAFT=1`), a request with `top_k` around 32,000 hung every rank waiting for its
-  candidates; the same requests pass with the pass off. The engine had this before 0005 too (below 32,256
-  candidates the old and new code send the same thing). Windows of more than `TF_DSV41_SPEC_MAX_COUNT` (4,096)
-  candidates a row now skip the speculation, which saves at most ~4 ms a round. The root cause is not found yet.
+- **The first very wide sampled request** (found while testing the above on the four Sparks): a request with `top_k`
+  in the tens of thousands, before any wider window, timed out every follower's Engram gate at layer 14. The
+  candidates' pinned host buffer grew (`cudaHostAlloc`, which can wait for the device) after the window's forward was
+  queued, while that forward still waited for the rank's Engram row reads. It now grows before the forward
+  (`cand_reserve`). The engine had this before 0005 too: below 32,256 candidates the old and new code are the same.
 - The gate scorer and DSpark delta shards (both off in production) now handle any rank count and uneven splits.
 
 ## What is not solved

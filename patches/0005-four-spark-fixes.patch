@@ -21,10 +21,10 @@ Subject: [PATCH] deepseek_v41: four-Spark fixes from the TP=4 review (uneven
 - attn_pf: BMQ 32 on a rank with 16 heads runs with 16 heads a program
   (was: a silent fallback to the chunk kernels)
 - NVMe session tier: the world size is part of the compat ident
-- speculative DSpark pass: skipped after windows of more than
-  TF_DSV41_SPEC_MAX_COUNT (4,096) candidates a row; a sampled request with
-  top_k ~32,000 hung every rank in the candidates' wait with it on (found
-  while testing the above on four Sparks; the same requests pass without it)
+- candidates' pinned buffer grown before a window's forward is queued
+  (cand_reserve), not after: the first sampled request with top_k in the
+  tens of thousands timed out every follower's Engram gate at layer 14
+  (found on four Sparks while testing the above)
 - gate scorer: any rank count (was two); DSpark delta shards follow the
   128-block split
 - tests: test_dsv41_four_sparks.py; the thread communicator refuses unequal
@@ -36,7 +36,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../families/deepseek_v41/__init__.py         |   1 +
  .../deepseek_v41/cuda/csa2/attn_pf.py         |  10 +-
  .../deepseek_v41/cuda/csa2/backend.py         |   9 +-
- .../families/deepseek_v41/cuda/decode.py      |   7 +
+ .../families/deepseek_v41/cuda/decode.py      |   1 +
  .../families/deepseek_v41/cuda/draft_head.py  |  15 +-
  .../families/deepseek_v41/cuda/dsparkdelta.py |  17 +-
  .../families/deepseek_v41/cuda/engine.py      |   6 +-
@@ -44,10 +44,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../families/deepseek_v41/cuda/gate.py        |  13 +-
  .../families/deepseek_v41/cuda/pick.py        |  33 +-
  .../families/deepseek_v41/cuda/planlink.py    |  97 ++++-
- .../families/deepseek_v41/cuda/slots.py       |   4 +-
+ .../families/deepseek_v41/cuda/slots.py       |  20 +-
  .../families/deepseek_v41/cuda/stack.py       |   2 +-
  tests/dsv41_fakes.py                          |   3 +
- tests/test_dsv41_four_sparks.py               | 361 ++++++++++++++++++
+ tests/test_dsv41_four_sparks.py               | 351 ++++++++++++++++++
  16 files changed, 538 insertions(+), 44 deletions(-)
  create mode 100644 tests/test_dsv41_four_sparks.py
 
@@ -141,30 +141,17 @@ index e685631e09dd21d6eec68777a34186bb8fd5e1a1..0000c798ee589ca53eff031315b4e5d6
  
              return attn_pf.attention(q, rows, sel, counts, swa.kernel(), lo, win.t, sink, table.cs, out, ring=ring,
 diff --git a/src/tensorfold/families/deepseek_v41/cuda/decode.py b/src/tensorfold/families/deepseek_v41/cuda/decode.py
-index 2c512ba574cc641d5928aebc15b7c8bfe0f92c85..2a3900f58ed8667583b30b9074c75393712c6119 100644
+index 2c512ba574cc641d5928aebc15b7c8bfe0f92c85..8540c259acb29fc68f95e0f384ca363e60face86 100644
 --- a/src/tensorfold/families/deepseek_v41/cuda/decode.py
 +++ b/src/tensorfold/families/deepseek_v41/cuda/decode.py
-@@ -49,6 +49,12 @@ def dspark_enabled() -> bool:
-     return (os.environ.get("TF_DSV41_DSPARK", "1").strip() or "1") != "0"
- 
- 
-+# The speculative DSpark pass (``spec.py``) only after windows of at most this many candidates a row. A sampled
-+# request with top_k ~32,000 and the pass on hung every rank in the candidates' wait (2026-10-05, four Sparks; the
-+# same requests pass with TF_DSV41_SPEC_DRAFT=0): such rows skip the speculation, which saves ~4 ms a round at most.
-+SPEC_MAX_COUNT = int(os.environ.get("TF_DSV41_SPEC_MAX_COUNT", "") or 4096)
-+
-+
- class LazyEngram:
-     """A window's Engram inputs, gathered a layer at a time when the forward first asks for it (``rows[L]``), so the
-     reads of layer 14 finish behind the launches of layers 0-13. ``items()`` gathers them all (graph staging). Both
-@@ -331,6 +337,7 @@ class DecodeForward(SlotsForward):
-             got = self.cand_fetch(g, k, count)          # the candidates' D2H copy is queued before the pass
-             if self.spec is not None:
-                 plain = not (masks is not None and any(m is not None for m in masks)) and not (nucleus and any(nucleus))
-+                plain = plain and count <= SPEC_MAX_COUNT   # wide rows (top_k in the tens of thousands): no speculation
-                 with PH("spec"):
-                     if spec and plain:
-                         self.spec.launch(windows, spec, got)
+@@ -324,6 +324,7 @@ class DecodeForward(SlotsForward):
+             spec = None
+         segs = [Seg(w.slot, w.start, tuple(w.tokens)) for w in list(windows) + extra]
+         sizes = [len(w.tokens) for w in list(windows) + extra]
++        self.cand_reserve(sum(sizes), count)    # before the forward: no pinned allocation while it may wait on Engram
+         with PH("forward"):
+             logits = self.graphs.run(segs) if self.graphs is not None else self.run(segs)
+         with PH("candidates"):
 diff --git a/src/tensorfold/families/deepseek_v41/cuda/draft_head.py b/src/tensorfold/families/deepseek_v41/cuda/draft_head.py
 index 1f17989b3da01bd18e571570abcbeb978f4908e6..606871b1e36ba119766ec3e245e9e38c40fe04b4 100644
 --- a/src/tensorfold/families/deepseek_v41/cuda/draft_head.py
@@ -474,10 +461,18 @@ index 5f41827c956f62e91a9730ce1f4ac4ece1e2efb2..0e0dc0ab2e04c3e702de9fc2825f82c7
      """The batcher's link: ``engine_link`` (the communicator's) unless TF_DSV41_PLAN_LINK=tcp."""
  
 diff --git a/src/tensorfold/families/deepseek_v41/cuda/slots.py b/src/tensorfold/families/deepseek_v41/cuda/slots.py
-index 96c7770f477e1534795f430801f61c68048bec7f..9fb59eacc40b32c0480f784dbb5d0bb2bb380bc4 100644
+index 96c7770f477e1534795f430801f61c68048bec7f..18792427a0bf09e872df3dd1759494d6b977d1bf 100644
 --- a/src/tensorfold/families/deepseek_v41/cuda/slots.py
 +++ b/src/tensorfold/families/deepseek_v41/cuda/slots.py
-@@ -249,9 +249,7 @@ class SlotsForward(Forward):
+@@ -218,6 +218,7 @@ class SlotsForward(Forward):
+     # -- verify windows ------------------------------------------------------------------------------------------
+     def window(self, windows, *, count: int, masks=None) -> Candidates:
+         segs = [Seg(w.slot, w.start, tuple(w.tokens)) for w in windows]
++        self.cand_reserve(sum(len(w.tokens) for w in windows), count)
+         logits = self.run(segs)
+         return self.candidates(logits, [len(w.tokens) for w in windows], count, masks)
+ 
+@@ -249,9 +250,7 @@ class SlotsForward(Forward):
                      allowed[a:a + n] = bits.reshape(n, -1)[:, :vl].bool()
                  a += n
              lg = lg.masked_fill(~allowed, float("-inf"))
@@ -488,6 +483,28 @@ index 96c7770f477e1534795f430801f61c68048bec7f..9fb59eacc40b32c0480f784dbb5d0bb2
          packed = torch.cat([vals, ids.view(torch.float32)], 1).contiguous()
          if self.world > 1:
              got = torch.empty((self.world * packed.numel(),), dtype=torch.float32, device=packed.device)
+@@ -259,6 +258,21 @@ class SlotsForward(Forward):
+             return got.view(self.world, R, 2 * k), k
+         return packed.view(1, R, 2 * k), k
+ 
++    def cand_reserve(self, rows: int, count: int) -> None:
++        """Grow the candidates' pinned buffer for ``rows`` rows of ``count`` before the window's forward is queued.
++
++        Pinned host memory comes from ``cudaHostAlloc``, which can wait for the device. Grown inside ``cand_fetch``
++        (after the forward is queued), the first window wider than any before (a sampled request with top_k in the
++        tens of thousands) waited on a forward whose Engram gate (``engram_gate``) was still waiting for this rank's
++        row reads: every follower timed out at layer 14 (2026-10-05, four Sparks; masked nucleus rows, whose full-
++        vocabulary candidates are fetched after the window, had grown it first in the runs that passed)."""
++
++        k = min(int(count), self.vocab_wide)
++        need = max(int(rows) * 2 * min(int(count), self.world * k), 4096)
++        buf = self.__dict__.get("_cand_pin")
++        if self.device.type == "cuda" and (buf is None or buf.numel() < need):
++            self.__dict__["_cand_pin"] = torch.empty((need,), dtype=torch.float32, pin_memory=True)
++
+     def cand_fetch(self, g: torch.Tensor, k: int, count: int):
+         """The merged, sorted candidates (``vsample.merge``: the order ``np.lexsort((ids, -values))`` gave on the
+         host) copied to pinned memory without blocking: a handle for ``cand_wait``; the device rows are ``.dev``."""
 diff --git a/src/tensorfold/families/deepseek_v41/cuda/stack.py b/src/tensorfold/families/deepseek_v41/cuda/stack.py
 index 9c4c44caaec9265465f251acd9028641b22ae43f..f9d604e6ac2edc7516f2c79d227e67b86d7b058f 100644
 --- a/src/tensorfold/families/deepseek_v41/cuda/stack.py
@@ -517,10 +534,10 @@ index ca89c7994dd125322a540d913d82f87e64459001..9df8911e832b05ff5b5a00758ce5be52
  
 diff --git a/tests/test_dsv41_four_sparks.py b/tests/test_dsv41_four_sparks.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..46e3446a8f68cf34b029c7ad950e788708a053bb
+index 0000000000000000000000000000000000000000..47a151beb4b3c6364831d160ffcbe0cb92d95546
 --- /dev/null
 +++ b/tests/test_dsv41_four_sparks.py
-@@ -0,0 +1,361 @@
+@@ -0,0 +1,351 @@
 +# SPDX-License-Identifier: MIT
 +"""Four ranks with uneven slices: the bugs jayleaton's review of the TP=4 port found (PR #6), each pinned here.
 +
@@ -855,33 +872,23 @@ index 0000000000000000000000000000000000000000..46e3446a8f68cf34b029c7ad950e7887
 +    assert [DD.shard("col", A, torch.randn(1024, 8), r, 2)[1].shape[0] for r in range(2)] == [512, 512]
 +
 +
-+def test_wide_candidate_rows_skip_the_speculative_pass(ck4, monkeypatch):
-+    """``TF_DSV41_SPEC_DRAFT=1``: windows of more than ``SPEC_MAX_COUNT`` candidates a row launch no speculative
-+    DSpark pass (top_k ~32,000 hung every rank with it on); narrower ones still do; replies are the same either way."""
++def test_candidates_pinned_buffer_grows_before_the_forward(ck4):
++    """``cand_reserve`` runs before a window's forward is queued, sized for the merged rows (``rows x 2 c``,
++    c = min(count, world x min(count, widest slice))): growing pinned memory after it waited on a forward whose
++    Engram gate was still waiting for row reads (top_k ~32,000-40,000 timed out every follower on four Sparks)."""
 +
-+    from tensorfold.families.deepseek_v41.cuda import decode as DEC
++    from tensorfold.families.deepseek_v41.cuda.protocol import Rows
 +
-+    monkeypatch.setenv("TF_DSV41_SPEC_DRAFT", "1")
-+    monkeypatch.delenv("TF_DSV41_DRAFT_HEAD", raising=False)
-+    wide = Sampling(seed=5, temperature=0.9, top_k=300)            # count 308 > the limit below
-+    narrow = Sampling(seed=5, temperature=0.9, top_k=20)
-+
-+    def go(sampling, limit):
-+        monkeypatch.setattr(DEC, "SPEC_MAX_COUNT", limit)
-+        fw = DF.forward(ck4, slots=1)
-+        assert fw.spec is not None
-+        launched = []
-+        real = fw.spec.launch
-+        fw.spec.launch = lambda *a, **k: launched.append(1) or real(*a, **k)
-+        got = DF.run(DF.batcher(ck4, fw, n=1), [Job(list(PROMPTS[0]), 12, sampling)])
-+        return got, len(launched)
-+
-+    with N.exact():
-+        skipped, n0 = go(wide, 64)
-+        allowed, n1 = go(wide, 4096)
-+        _, n2 = go(narrow, 64)
-+    assert n0 == 0 and n1 > 0 and n2 > 0
-+    assert skipped == allowed
++    fw = DF.forward(ck4, slots=1, dspark=False)
++    order = []
++    real_reserve, real_run = fw.cand_reserve, fw.run
++    fw.cand_reserve = lambda rows, count: order.append(("reserve", rows, count)) or real_reserve(rows, count)
++    fw.run = lambda segs, **k: order.append(("forward",)) or real_run(segs, **k)
++    fw.prefill([__import__("tensorfold.families.deepseek_v41.cuda.protocol", fromlist=["Piece"]).Piece(
++        0, 0, tuple(PROMPTS[0][:-1]))], mode="full")
++    order.clear()
++    fw.window([Rows(0, len(PROMPTS[0]) - 1, (PROMPTS[0][-1],))], count=300)
++    assert order[:2] == [("reserve", 1, 300), ("forward",)]
 -- 
 2.43.0
 
