@@ -52,7 +52,8 @@ Warm repeats reuse the prefix: 0.26-0.64 s at every depth.
   == one rank token for token (`tests/test_dsv41_tp4.py`, `test_dsv41_pipe.py`, `test_dsv41_four_sparks.py`).
 
 Raw files: [`results/four-sparks-20261004/`](results/four-sparks-20261004/README.md),
-[`results/prefill-speed-20261005/`](results/prefill-speed-20261005/README.md). The same cluster's earlier deployments
+[`results/prefill-speed-20261005/`](results/prefill-speed-20261005/README.md),
+[`results/four-spark-fixes-20261005/`](results/four-spark-fixes-20261005/README.md). The same cluster's earlier deployments
 (SGLang on the FP8 checkpoint, vLLM) and a dated history of every change: [spark-bench](https://github.com/neko-legends/spark-bench).
 
 ## What four Sparks change
@@ -132,13 +133,22 @@ full table: [docs/TWO_SPARKS.md#api](docs/TWO_SPARKS.md#api) (unchanged at four 
 ### Fixed in 0005 (2026-10-05)
 
 Jay reviewed the TP=4 port ([PR #6](https://github.com/jayleaton/deepseek-v41-tensorfold-spark/pull/6)) and found
-bugs that only uneven slices or more than two ranks expose. All fixed, each with a test that fails without the fix
-(`tests/test_dsv41_four_sparks.py`):
+bugs that only uneven slices or more than two ranks expose. All fixed, with tests in `tests/test_dsv41_four_sparks.py`
+(each review bug's test fails without its fix), and checked on the four Sparks (2026-10-05; serving since 11:30):
+
+- the four benchmark replies (20k and 160k, prose and code) are byte-identical to the 0004 build's; cold first token
+  5.8-6.8 s (20k) and 38.8-39.0 s (160k), as before; decode the same as 0004 in an A/B in one window;
+- the hidden code word found 3 / 3, the short gates 7 / 7;
+- sampled requests past the narrow slices pass: nucleus rows, nucleus with a JSON schema (full-vocabulary
+  candidates), `top_k` 32,000 and 40,000, including `top_k` 40,000 as the first request after a boot.
+
+The fixes:
 
 - **Candidates past the narrow vocabulary slices**: every rank took `min(count, its own width)` candidates, so a
-  count above 32,256 (a nucleus request with `top_k` 0 asks for the whole vocabulary) all-gathered unequal sizes: a
-  hang or misaligned candidates on NCCL / RoCE. Every rank now sends the widest slice's count, narrower slices
-  padded with entries that sort after every real token (`pick.rank_top`).
+  count above 32,256 (`top_k` above that, or masked nucleus rows, which ask for the whole vocabulary) all-gathered
+  unequal sizes. On the four Sparks, the 0004 build answered a `top_k` 40,000 request with an illegal memory access
+  on ranks 2 and 3 (the narrow slices) and the server stopped. Every rank now sends the widest slice's count,
+  narrower slices padded with entries that sort after every real token (`pick.rank_top`).
 - **Trimmed draft head** (`TF_DSV41_DRAFT_HEAD=trim`): the per-rank id lists assumed equal slices; rank 2 refused to
   boot. They now follow the 128-block split.
 - **TCP plan link** (`TF_DSV41_PLAN_LINK=tcp`): followers now say their rank and world size; rank 0 refuses strays,
@@ -149,11 +159,15 @@ bugs that only uneven slices or more than two ranks expose. All fixed, each with
   attention with 16 heads a program instead of silently falling back to the chunk kernels.
 - **NVMe session tier**: the world size is part of the directory's identity, so an entry written by two Sparks is
   never resumed by four.
-- **The first very wide sampled request** (found while testing the above on the four Sparks): a request with `top_k`
-  in the tens of thousands, before any wider window, timed out every follower's Engram gate at layer 14. The
-  candidates' pinned host buffer grew (`cudaHostAlloc`, which can wait for the device) after the window's forward was
-  queued, while that forward still waited for the rank's Engram row reads. It now grows before the forward
-  (`cand_reserve`). The engine had this before 0005 too: below 32,256 candidates the old and new code are the same.
+- **The first very wide window** (found while testing the above on the four Sparks): with the gather fixed, a
+  sampled request with `top_k` 32,000-40,000 as the server's first wide request still timed out every follower's
+  Engram gate at layer 14 (4 of 4 runs); runs whose first wide request was a JSON nucleus request passed. Most
+  likely cause: the window needed the large-`k` top-k and large-row sort kernels for the first time, and CUDA's lazy
+  module loading loaded them while the forward still waited on host threads (the Engram gate, the RoCE exchanges).
+  The candidate kernels of every width class now run once at boot on every rank (`cand_warm`), and the candidates'
+  pinned buffer grows before a window's forward is queued (`cand_reserve`): since then the same requests pass in
+  every run (2 of 2, one with `top_k` 40,000 as the first request after a boot). Not fully explained: the 0004 build
+  once answered a first `top_k` 32,000 request without the warm-up.
 - The gate scorer and DSpark delta shards (both off in production) now handle any rank count and uneven splits.
 
 ## What is not solved
