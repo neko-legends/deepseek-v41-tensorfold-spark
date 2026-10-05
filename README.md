@@ -13,6 +13,11 @@ from local NVMe, EXL3 expert and dense kernels tuned for GB10, **exact** DSpark 
 bounded-replay prefill, 4 request slots over a shared FP8 KV pool (4 x 300K tokens), sessions with an NVMe tier,
 prepared per-rank folders for ~40 s restarts, structured output and DSML tool calls.
 
+> **Four Sparks:** the same engine also runs TP=4 on four DGX Sparks behind a switch (`patches/0003`,
+> `scripts/serve4.sh`): decode 1.68-1.75x a SGLang TP4 deployment of the FP8 checkpoint on the same four nodes
+> (prose 63.4 / code 100.2 tok/s over 1k-160k prompts; 4 streams 119.2 tok/s aggregate), with slower cold prompt
+> reading. Setup, numbers and limits: [docs/FOUR_SPARKS.md](docs/FOUR_SPARKS.md).
+
 > **Work in progress.** Measured on one pair of Sparks, against one baseline. Knobs, defaults and numbers may change.
 > Read [What is not solved](#what-is-not-solved) before relying on it.
 
@@ -236,15 +241,16 @@ path renders `low` as 25; we keep DeepSeek's 50.
 
 ## The engine
 
-`vendor/TensorFold` is upstream TensorFold v0.6.0, unmodified. `patches/` holds two patches, applied in order by the
+`vendor/TensorFold` is upstream TensorFold v0.6.0, unmodified. `patches/` holds three patches, applied in order by the
 Dockerfile:
 
 | patch | what | licence |
 | --- | --- | --- |
 | [`0001-spark-stack-060.patch`](patches/0001-spark-stack-060.patch) | the GLM-5.3-Flash two-Spark engine (`families/glm5_next/spark/`) rebased onto 0.6.0, the CUDA communicator interface (`cuda/comm.py`), the family `CUDA_SERVE` hook (`cli.py`, `families/glm5_next/__init__.py`), the server's descriptor fix (`server/cancellation.py`), packaging (`pyproject.toml`), recipes and tests |
 | [`0002-deepseek-v41-family.patch`](patches/0002-deepseek-v41-family.patch) | `families/deepseek_v41/` and its tests, the EXL3 linear's device-side skip (`cuda/exl3/linear.*`), fp64 in `cuda/comm.py`, `--kv-dtype fp8` (`cli_args.py`), model aliases in the GLM server, packaging, NOTICE entries |
+| [`0003-four-sparks.patch`](patches/0003-four-sparks.patch) | four Sparks (TP=4): whole-128-block uneven splits (`weights.block_bounds`), `--tp 4 --rank 0..3`, N-way rank agreement and plan link, RoCE post rotation, csa2 sources in `package-data`, `/health` draft counters, sync-free expert counts, opt-in prefill profile, `tests/test_dsv41_tp4.py`; see [`docs/FOUR_SPARKS.md`](docs/FOUR_SPARKS.md) |
 
-Together they are every engine change production runs (development commit `767ad9f`, 390 files over v0.6.0): applying
+0001 and 0002 together are every engine change two-Spark production runs (development commit `767ad9f`, 390 files over v0.6.0): applying
 them to v0.6.0 reproduces that tree except for reworded comments and the excluded draft-vocabulary files
 ([`docs/ENGINE.md`](docs/ENGINE.md) lists each difference).
 
@@ -264,7 +270,7 @@ TP=2 split.
   window, and BRANCHES left the 1-row window unstable between boots (26.2 / 31.5 ms, +2.25 ms on average). Both are in
   the engine, default 0. The CUDA attention core in `TF_DSV41_ATTN_CUDA` is slower than Triton on its own and helps
   only with the top-k beside it.
-- **`/health`** reports `drafted_total` / `accepted_total` as 0 for this family (the counters are not wired).
+- **`/health`** reported `drafted_total` / `accepted_total` as 0 for this family before patch 0003 wired them.
 - **Vision** is not wired for this family.
 - **No trimmed draft-head vocabulary is shipped** (`TF_DSV41_DRAFT_HEAD=trim`, off by default and not adopted). The
   development ranking was counted from private chat transcripts and is excluded, so `trim` needs
@@ -281,6 +287,7 @@ TP=2 split.
 | `docker/Dockerfile` | the image: NVIDIA PyTorch 26.07 + xgrammar + TensorFold with the patches |
 | `config/prod.env.example` | the measured configuration, with placeholders for your hosts and paths |
 | `scripts/serve.sh` | build / prebuild / preflight / start / stop / status / watchdog / `run` (engine benchmarks on both ranks) |
+| `scripts/serve4.sh`, `scripts/keeper4.sh`, `config/tp4.env.example` | the four-Spark launcher (ship / prebuild / start / stop / status / logs / `run`), an optional cron keeper, the TP=4 overrides ([`docs/FOUR_SPARKS.md`](docs/FOUR_SPARKS.md)) |
 | `scripts/prebuild_ext.py` | builds every CUDA extension a rank loads (`scripts/serve.sh prebuild` runs it in the image on both nodes) |
 | `scripts/pack_engram.py` | the per-rank Engram shards from DeepSeek's checkpoint |
 | `scripts/canary.py`, `scripts/boot-start.sh`, `scripts/systemd/` | post-start canary, start at boot, watchdog units |
