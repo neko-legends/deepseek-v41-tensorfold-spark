@@ -36,7 +36,7 @@ RUN python -c "import torch; print(torch.__version__)" > /tmp/torch-before.txt \
  && pip install "transformers==5.17.0" \
  && python -c "import torch, xgrammar, transformers; \
 v = open('/tmp/torch-before.txt').read().strip(); assert torch.__version__ == v, (torch.__version__, v); \
-print('xgrammar', xgrammar.__version__, 'transformers', transformers.__version__, 'torch', torch.__version__)" \
+print('xgrammar', getattr(xgrammar, '__version__', '?'), xgrammar.GrammarCompiler, 'transformers', transformers.__version__, 'torch', torch.__version__)" \
  && rm /tmp/torch-before.txt
 
 # TensorFold v0.6.0 (the submodule) + patches/*.patch in order. TF_SRC: another source tree in the build context
