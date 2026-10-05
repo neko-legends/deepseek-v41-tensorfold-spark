@@ -16,7 +16,9 @@ prepared per-rank folders for ~40 s restarts, structured output and DSML tool ca
 > **Four Sparks:** the same engine also runs TP=4 on four DGX Sparks behind a switch (`patches/0003`,
 > `scripts/serve4.sh`): decode 1.68-1.75x a SGLang TP4 deployment of the FP8 checkpoint on the same four nodes
 > (prose 63.4 / code 100.2 tok/s over 1k-160k prompts; 4 streams 119.2 tok/s aggregate), with slower cold prompt
-> reading. Setup, numbers and limits: [docs/FOUR_SPARKS.md](docs/FOUR_SPARKS.md).
+> reading. Setup, numbers and limits: [docs/FOUR_SPARKS.md](docs/FOUR_SPARKS.md). With `patches/0004` the four ranks
+> read long prompts as a pipeline: a cold 160k-token prompt in ~39 s instead of ~83 s
+> ([docs/PREFILL_SPEED.md](docs/PREFILL_SPEED.md)).
 
 > **Work in progress.** Measured on one pair of Sparks, against one baseline. Knobs, defaults and numbers may change.
 > Read [What is not solved](#what-is-not-solved) before relying on it.
@@ -241,7 +243,7 @@ path renders `low` as 25; we keep DeepSeek's 50.
 
 ## The engine
 
-`vendor/TensorFold` is upstream TensorFold v0.6.0, unmodified. `patches/` holds three patches, applied in order by the
+`vendor/TensorFold` is upstream TensorFold v0.6.0, unmodified. `patches/` holds four patches, applied in order by the
 Dockerfile:
 
 | patch | what | licence |
@@ -249,6 +251,7 @@ Dockerfile:
 | [`0001-spark-stack-060.patch`](patches/0001-spark-stack-060.patch) | the GLM-5.3-Flash two-Spark engine (`families/glm5_next/spark/`) rebased onto 0.6.0, the CUDA communicator interface (`cuda/comm.py`), the family `CUDA_SERVE` hook (`cli.py`, `families/glm5_next/__init__.py`), the server's descriptor fix (`server/cancellation.py`), packaging (`pyproject.toml`), recipes and tests |
 | [`0002-deepseek-v41-family.patch`](patches/0002-deepseek-v41-family.patch) | `families/deepseek_v41/` and its tests, the EXL3 linear's device-side skip (`cuda/exl3/linear.*`), fp64 in `cuda/comm.py`, `--kv-dtype fp8` (`cli_args.py`), model aliases in the GLM server, packaging, NOTICE entries |
 | [`0003-four-sparks.patch`](patches/0003-four-sparks.patch) | four Sparks (TP=4): whole-128-block uneven splits (`weights.block_bounds`), `--tp 4 --rank 0..3`, N-way rank agreement and plan link, RoCE post rotation, csa2 sources in `package-data`, `/health` draft counters, sync-free expert counts, opt-in prefill profile, `tests/test_dsv41_tp4.py`; see [`docs/FOUR_SPARKS.md`](docs/FOUR_SPARKS.md) |
+| [`0004-prefill-speed.patch`](patches/0004-prefill-speed.patch) | faster prompt reading on four Sparks, all opt-in: pipelined prompts across the ranks (`pipe.py`, `TF_DSV41_PREFILL_PIPE`), split selections (`TF_DSV41_INDEX_SPLIT`), overlapped exchanges (`TF_DSV41_PREFILL_OVERLAP`), the `ppbench.py` prototype, `tests/test_dsv41_pipe.py` and `test_dsv41_overlap.py`; see [`docs/PREFILL_SPEED.md`](docs/PREFILL_SPEED.md) |
 
 0001 and 0002 together are every engine change two-Spark production runs (development commit `767ad9f`, 390 files over v0.6.0): applying
 them to v0.6.0 reproduces that tree except for reworded comments and the excluded draft-vocabulary files

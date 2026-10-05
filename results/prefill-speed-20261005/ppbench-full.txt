@@ -1,0 +1,1 @@
+[ppbench r0] pipeline 78 chunks x 2048 rows: 41.7 s; round median 0.508 s; stage compute medians [0.404, 0.402, 0.403, 0.342]; TP chunks [1.254, 0.926]; compare (x_rel, out_rel per chunk) [0.26057, 0.25464, 0.25437, 0.2523]
