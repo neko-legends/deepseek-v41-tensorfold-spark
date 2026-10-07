@@ -37,17 +37,28 @@ Checks on the G19 build: code word at 30 / 60 / 85% of 20k / 80k / 158k-token pr
 nucleus) 6 / 6; an image question answered; the greedy reply byte for byte the G13 build's. Same tok/s within noise:
 the gain is reading prompts (~7% at 160k: G19's speed switches and fused dense prefill), the 420K context and images.
 
-These tables' decode runs (1-stream, 512-token replies, 2 trials) are lower than the 2026-10-04 sweep below
-(median of 3, 1k-160k): a different, shorter harness, the same in both columns.
+Both columns of this table ran on the NCCL fallback, not RoCE (see the note under Decode below), which is most of
+why they sit below the decode sweep. The harness also differs (1-stream, 512-token replies, 2 trials). Both columns
+were measured the same way, so the comparison between them holds.
 
-### Decode (2026-10-04)
+### Decode (2026-10-07, G19 on RoCE)
 
 | prompt | 1k | 20k | 40k | 80k | 160k | geometric mean |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| prose, tok/s | 63.6 | 65.7 | 64.0 | 62.8 | 61.0 | **63.4** |
-| code, tok/s | 104.9 | 97.0 | 96.4 | 103.1 | 99.8 | **100.2** |
+| prose, tok/s | 66.0 | 66.7 | 68.7 | 69.6 | 62.0 | **66.5** |
+| code, tok/s | 107.2 | 103.5 | 105.0 | 101.7 | 103.4 | **104.1** |
+| cold first token, prose / code | 0.9 / 0.7 s | 6.0 / 5.3 s | 9.3 / 9.4 s | 17.9 / 17.8 s | 35.9 / 35.8 s | |
+| *2026-10-04 build (G13, `0003` alone), prose / code* | *63.6 / 104.9* | *65.7 / 97.0* | *64.0 / 96.4* | *62.8 / 103.1* | *61.0 / 99.8* | *63.4 / 100.2* |
 
-Median of 3 a cell. Four streams at once: **119.2 tok/s** aggregate (`dsbench`, single-stream median 62.6).
+Median of 3 a cell (the published depth sweep: 512 tokens, greedy, thinking off, trial 0 cold, isolated). Four streams
+at once: **122.2 tok/s** aggregate (`dsbench`, single-stream median 63.8; 2026-10-04: 119.2 / 62.6).
+
+**Check the transport after every start.** A run-time RoCE failure writes `/cache/roce-failed` in the cache volume, and
+while that file exists every start serves on NCCL; the round-plan link falls back to TCP too. A crash test left one
+behind on 2026-10-05, and our server ran on NCCL for two days without an error. On the same build, NCCL vs RoCE
+(`m2bench`, 1 stream): code 107.2 vs **119.6** tok/s, prose 55.8 vs **66.4**, 1-row verify window 18.7 vs **16.3** ms.
+Rank 0's log should say `all-gathers of up to ... over RoCE` and `plan link: rdma`. If it doesn't, look for the file,
+fix the cause and move the file aside.
 
 ### Reading a new prompt (2026-10-05)
 
