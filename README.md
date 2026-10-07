@@ -2,13 +2,13 @@
 
 Serve DeepSeek-V4.1-Flash (the 2.9 bpw EXL3 pack) across **four** NVIDIA DGX Sparks, tensor-parallel (TP=4) over a
 switched CX7 RoCE fabric, behind an OpenAI-compatible API: exact DSpark speculative decoding, Engram rows from local
-NVMe, 4 request slots of up to 300K tokens, NVMe sessions, structured output and DSML tool calls.
+NVMe, 4 request slots of up to 420K tokens, image input, NVMe sessions, structured output and DSML tool calls.
 
 This is the four-Spark fork of **[jayleaton/deepseek-v41-tensorfold-spark](https://github.com/jayleaton/deepseek-v41-tensorfold-spark)**.
 The engine, the DeepSeek-V4.1-Flash family and nearly everything in this repository are Jay Leaton's work on
-[TensorFold](https://github.com/ashhart/TensorFold); this fork adds what four Sparks need (`patches/0003`-`0005`), a
-four-node launcher, and the measurements. **Two Sparks? Use Jay's repository**: it is the maintained two-Spark recipe
-and has moved on since this fork branched (below).
+[TensorFold](https://github.com/ashhart/TensorFold); this fork adds what four Sparks need (`patches/0003`), a
+four-node launcher, and the measurements. Since 2026-10-07 it runs Jay's G19 engine. **Two Sparks? Use Jay's
+repository**: it is the maintained two-Spark recipe.
 
 > Measured on one cluster (four GB10s, one switch), one boot a configuration. Read [What is not solved](#what-is-not-solved)
 > before relying on it.
@@ -18,6 +18,27 @@ and has moved on since this fork branched (below).
 Weights: [`dealignai/DeepSeek-V4.1-Flash-UNCENSORED-EXL3-2.9bpw`](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-UNCENSORED-EXL3-2.9bpw).
 Configuration: [`config/prod.env.example`](config/prod.env.example) + [`config/tp4.env.example`](config/tp4.env.example)
 (expert pruning on, `TF_DSV41_EXPERT_TOPP=0.85`), thinking off, temperature 0, 512-token replies, isolated runs.
+
+### G19 on four Sparks (2026-10-07)
+
+Jay's G19 engine (engine `7bd2d67`) with this fork's `0003`, live since 2026-10-07, against the G13 build it replaced,
+one boot each in the same window:
+
+| | G13 build | **G19 build** |
+| --- | ---: | ---: |
+| decode, prose 1k / 20k / 160k (cold, tok/s) | 53.1 / 50.1 / 47.5 | 54.5 / 50.3 / 48.6 |
+| decode, code 1k / 20k / 160k (cold, tok/s) | 88.9 / 80.8 / 84.9 | 90.7 / 82.3 / 86.2 |
+| cold first token, 20k / 160k | 5.9-6.7 s / 38.9-39.1 s | **5.4-6.0 s / 35.9-36.2 s** |
+| context a request slot | 300K | **420K** (KV pool 1,201,152 tokens, `TF_DSV41_POOL_TOKENS`) |
+| image input | no | **yes** (`TF_DSV41_IMAGES=native`) |
+
+Checks on the G19 build: code word at 30 / 60 / 85% of 20k / 80k / 158k-token prompts 3 / 3, and at 50% of a
+~405k-token prompt 1 / 1; short gates 7 / 7; six wide sampling cases (`top_k` 40,000 and 32,000, nucleus, JSON
+nucleus) 6 / 6; an image question answered; the greedy reply byte for byte the G13 build's. Same tok/s within noise:
+the gain is reading prompts (~7% at 160k: G19's speed switches and fused dense prefill), the 420K context and images.
+
+These tables' decode runs (1-stream, 512-token replies, 2 trials) are lower than the 2026-10-04 sweep below
+(median of 3, 1k-160k): a different, shorter harness, the same in both columns.
 
 ### Decode (2026-10-04)
 
@@ -114,7 +135,7 @@ Setup notes and lessons from the first boots: [docs/FOUR_SPARKS.md](docs/FOUR_SP
 
 OpenAI-compatible on `HOST:PORT` (`127.0.0.1:8000` by default: put your own proxy and authentication in front):
 `/v1/chat/completions` (streaming, tool calls, `response_format`), `/v1/completions` (text or token ids),
-`/tokenize`, `/v1/models`, `/health`, `/metrics` (TensorFold's own series and, since 0006, the vLLM-named ones
+`/tokenize`, `/v1/models`, `/health`, `/metrics` (TensorFold's own series and, from `0003`, the vLLM-named ones
 fleet dashboards read), `/v1/model_info` (`max_num_seqs`: the request slots). Thinking follows DeepSeek-V4.1's encoding and is on by default
 (`TF_DSV41_THINKING=0` turns it off); `reasoning_effort` `none` / `low` / `medium` / `high` / `max` or 1-100. The
 full table: [docs/TWO_SPARKS.md#api](docs/TWO_SPARKS.md#api) (unchanged at four Sparks).
@@ -126,13 +147,14 @@ full table: [docs/TWO_SPARKS.md#api](docs/TWO_SPARKS.md#api) (unchanged at four 
 | patch | from | what |
 | --- | --- | --- |
 | [`0001-spark-stack-060.patch`](patches/0001-spark-stack-060.patch) | jayleaton | the GLM-5.3-Flash Spark engine stack rebased onto 0.6.0: communicator, RoCE all-gather, server pieces |
-| [`0002-deepseek-v41-family.patch`](patches/0002-deepseek-v41-family.patch) | jayleaton | the DeepSeek-V4.1-Flash family (engine G13, `767ad9f`) |
-| [`0003-four-sparks.patch`](patches/0003-four-sparks.patch) | this fork | TP=4: whole-block uneven splits, `--tp 4 --rank 0..3`, N-way rank agreement and plan link, RoCE post rotation, `/health` draft counters, sync-free expert counts, opt-in prefill profile |
-| [`0004-prefill-speed.patch`](patches/0004-prefill-speed.patch) | this fork | pipelined prompt reading across the four ranks, split selections, overlapped exchanges (all opt-in; on in `tp4.env.example`) |
-| [`0005-four-spark-fixes.patch`](patches/0005-four-spark-fixes.patch) | this fork | the uneven-slice bugs jayleaton's review of the TP=4 port found (below) |
-| [`0006-vllm-metrics.patch`](patches/0006-vllm-metrics.patch) | this fork | vLLM-named series on `/metrics` (requests running / waiting, token and finish counters) and `GET /v1/model_info` (`max_num_seqs`, `max_model_len`), so dashboards and routers built for vLLM see the 4 request slots instead of assuming 1 |
+| [`0002-deepseek-v41-family.patch`](patches/0002-deepseek-v41-family.patch) | jayleaton | the DeepSeek-V4.1-Flash family (engine G19, `7bd2d67`) |
+| [`0003-four-sparks.patch`](patches/0003-four-sparks.patch) | this fork | four ranks (TP=4): whole-block uneven splits, `--tp 4 --rank 0..3`, N-way rank agreement, plan link (TCP and RDMA), fail-fast and memory floor; the fixes from Jay's review; pipelined prompt reading, split selections and overlapped exchanges (opt-in, on in `tp4.env.example`); `/health` draft counters; sync-free expert counts; vLLM-named `/metrics` series and `/v1/model_info` |
 
-### Fixed in 0005 (2026-10-05)
+Until 2026-10-07 the fork ran on G13 with these as patches 0003-0006 (branch `four-sparks-g13`). Jay's PR #6 asks for
+a smaller `0003` (four ranks and the review's fixes only, two-Spark output unchanged): that version is the `four-sparks`
+branch, verified byte-identical at TP=2 against his main.
+
+### Fixed 2026-10-05 (then patch 0005, now in 0003)
 
 Jay reviewed the TP=4 port ([PR #6](https://github.com/jayleaton/deepseek-v41-tensorfold-spark/pull/6)) and found
 bugs that only uneven slices or more than two ranks expose. All fixed, with tests in `tests/test_dsv41_four_sparks.py`
@@ -173,6 +195,10 @@ The fixes:
 - The gate scorer and DSpark delta shards (both off in production) now handle any rank count and uneven splits.
 
 ## How it was tested (2026-10-05)
+
+*This section describes the 2026-10-05 G13 build (patches 0001-0006, branch `four-sparks-g13`). The G19 build's checks are
+in [G19 on four Sparks](#g19-on-four-sparks-2026-10-07); its patches rebuild the same way, and its CPU suites pass but for
+the same three environment-dependent tests that fail on Jay's main.*
 
 Every number and claim on this page was checked these ways before `main` moved to it.
 
@@ -231,14 +257,11 @@ build was also tested on the same wide request: it crashed ranks 2 and 3. All of
 
 ## What is not solved
 
-- **Jay's G14-G19 are not in this fork.** This fork branched at engine G13; his newer main (image input, fail-fast
-  across ranks, adaptive prefill, an admission floor, RoCE link changes, faster decode on two Sparks) assumes two
-  ranks in places and needs porting to four.
 - The boot memory budget (`memory.load_check`) is anchored on two-Spark measurements: conservative on ranks 0 and 1,
   skipped on ranks 2 and 3. The live floor is MemAvailable ~26 GB a node with the pipeline on.
 - A pipelined prompt's bits are one rank's arithmetic, not the four-rank sum's (its own session tag): as different
   as the engine's own fast vs exact prefill kernels. Exact numerics give the same state either way.
-- Short prompts gain less from the pipeline (it fills in four steps): cold 20k is 5.8-6.8 s.
+- Short prompts gain less from the pipeline (it fills in four steps): cold 20k is 5.4-6.0 s.
 - One cluster, one boot a configuration; expert pruning is lossy (delete its three lines for the unpruned model).
 
 ## Documentation
