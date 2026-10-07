@@ -197,8 +197,9 @@ The fixes:
 ## How it was tested (2026-10-05)
 
 *This section describes the 2026-10-05 G13 build (patches 0001-0006, branch `four-sparks-g13`). The G19 build's checks are
-in [G19 on four Sparks](#g19-on-four-sparks-2026-10-07); its patches rebuild the same way, and its CPU suites pass but for
-the same three environment-dependent tests that fail on Jay's main.*
+in [G19 on four Sparks](#g19-on-four-sparks-2026-10-07). Its patches rebuild the same way. Its CPU suites pass except the
+three tests that also fail on Jay's main (they need his unpublished draft vocabulary or a network this sandbox lacks)
+and two that the fork's extra prompt-reading code trips (below, What is not solved).*
 
 Every number and claim on this page was checked these ways before `main` moved to it.
 
@@ -257,6 +258,9 @@ build was also tested on the same wide request: it crashed ranks 2 and 3. All of
 
 ## What is not solved
 
+- Two CPU tests fail on the G19 build's full `0003` (not on PR #6's smaller one): `test_dsv41_calib_knobs`
+  (the prompt-reading switches are not yet in the calibration key or its exempt list) and `test_dsv41_pdl`'s
+  forward-hook count (the overlapped-exchange refactor of the layer loop). Neither changes what the server computes.
 - The boot memory budget (`memory.load_check`) is anchored on two-Spark measurements: conservative on ranks 0 and 1,
   skipped on ranks 2 and 3. The live floor is MemAvailable ~26 GB a node with the pipeline on.
 - A pipelined prompt's bits are one rank's arithmetic, not the four-rank sum's (its own session tag): as different
