@@ -57,10 +57,62 @@ index 7a83cf4..93a9535 100644
  
  if __name__ == "__main__":
 diff --git a/src/tensorfold/families/deepseek_v41/cuda/dsparktrain.py b/src/tensorfold/families/deepseek_v41/cuda/dsparktrain.py
-index 22a24ac..9b9455b 100644
+index 22a24ac..02b4afc 100644
 --- a/src/tensorfold/families/deepseek_v41/cuda/dsparktrain.py
 +++ b/src/tensorfold/families/deepseek_v41/cuda/dsparktrain.py
-@@ -356,6 +356,9 @@ def evaluate(model: Drafter, data, sessions, *, seg: int = 96, max_segments: int
+@@ -39,6 +39,7 @@ from __future__ import annotations
+ import argparse
+ import json
+ import math
++import os
+ import time
+ 
+ import numpy as np
+@@ -130,6 +131,19 @@ class Drafter(torch.nn.Module):
+         self.cw = torch.nn.Parameter(ld.native(f"{self.names['conf']}.weight").reshape(-1).to(F32))
+         self.embed = src.tensor("embed.weight").to(BF16).to(self.dev)
+         self.head = dense(ld.x3("head"), device)
++        self.head_q4 = None
++        from . import draft_head as DH
++        if DH.settings().mode == "q4":                  # the engine's TF_DSV41_DRAFT_HEAD=q4: its 4-bit copy
++            from . import linear as LN
++
++            hx = ld.x3("head")
++            lin = LN.exl3_from(hx.trellis, hx.suh, hx.svh, hx.codebook, device) \
++                if torch.device(device).type == "cuda" else None
++            if lin is not None:
++                k = lin.k
++                packed, scales = DH.probe(lin, k, None, device, DH.group_of(k))
++                self.head_q4 = DH.dequant(packed, scales, DH.group_of(k)).t().contiguous()      # fp32 [k, V]
++                del packed, scales
+         self.blocks = torch.nn.ModuleList()
+         self.bw = []
+         for i in range(nb):
+@@ -194,7 +208,10 @@ class Drafter(torch.nn.Module):
+         c = self.cfg
+         t, h, _ = streams.shape
+         x = streams.reshape(t, -1)
+-        mixes = (x @ hc.fn.to(F32).t()) * torch.rsqrt(x.square().mean(-1, keepdim=True) + c.rms_norm_eps)
++        fn = hc.fn.to(F32)
++        if os.environ.get("TF_DSV41_MHC_FN", "").strip().lower() == "bf16":     # the engine's bf16 mixing weights
++            fn = bf(fn)
++        mixes = (x @ fn.t()) * torch.rsqrt(x.square().mean(-1, keepdim=True) + c.rms_norm_eps)
+         sc, base = hc.scale.to(F32), hc.base.to(F32)
+         pre = torch.sigmoid(mixes[:, :h] * sc[0] + base[:h]) + c.hc_eps
+         post = torch.sigmoid(mixes[:, h:2 * h] * sc[1] + base[h:2 * h]) * c.hc_post_alpha
+@@ -301,7 +318,10 @@ class Drafter(torch.nn.Module):
+             streams = self.hc_post(self.moe(b, xin), streams, post, comb)
+         hidden = self.collapse(streams, pre)
+         hn = bf(rms(hidden, self.norm + self.d_norm, c.rms_norm_eps))
+-        logits = (hn.to(BF16) @ self.head).to(F32)
++        if self.head_q4 is not None:                   # bf16 rows x the int4 codes' values, fp32 sums (q4_matmul)
++            logits = hn.to(BF16).to(F32) @ self.head_q4
++        else:
++            logits = (hn.to(BF16) @ self.head).to(F32)
+         prev = torch.cat([bt["anchor"].to(dev)[:, None], bt["serial"].to(dev)[:, :n - 1]], 1)
+         me = self.me(prev.reshape(-1))
+         V = logits.shape[-1]
+@@ -356,6 +376,9 @@ def evaluate(model: Drafter, data, sessions, *, seg: int = 96, max_segments: int
      tf = np.zeros(n)
      reach, kept = np.zeros(n), np.zeros(n)
      lens, agree, agree1, agree_n, rows = [], 0, 0, 0, 0
@@ -70,7 +122,7 @@ index 22a24ac..9b9455b 100644
      segs = data.segments(sessions, seg)
      if max_segments:
          segs = segs[:max_segments]
-@@ -392,11 +395,41 @@ def evaluate(model: Drafter, data, sessions, *, seg: int = 96, max_segments: int
+@@ -392,11 +415,41 @@ def evaluate(model: Drafter, data, sessions, *, seg: int = 96, max_segments: int
          agree1 += int((lg[m, 0] == dn[m, 0]).sum())
          agree_n += int(m.sum())
          rows += B
