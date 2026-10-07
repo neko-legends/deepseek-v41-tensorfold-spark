@@ -1,65 +1,23 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: neko-legends <neko-legends@users.noreply.github.com>
-Date: Mon, 5 Oct 2026 00:14:04 -0700
-Subject: [PATCH] deepseek_v41: run on four DGX Sparks (TP=4)
+Date: Mon, 5 Oct 2026 15:00:00 -0700
+Subject: [PATCH] deepseek_v41: four DGX Sparks on G19 (TP=4, pipelined prompts, review fixes, vLLM metrics)
 
-- tensor-parallel block partitions: every split on whole 128-wide Hadamard
-  blocks; even where possible (all TP2 shapes are unchanged), otherwise the
-  first ranks take one more block (experts 640/640/512/512, vocabulary
-  32,384/32,384/32,256/32,256)
-- the engine, family factory and CLI take --tp 4 / --rank 0..3; every rank
-  agreement, the session-tier key intersection and the sampler's candidate
-  gather run over world ranks
-- the TCP round-plan link broadcasts to every follower
-- RoCE all-gather: each proxy starts its posts at the next rank (no incast)
-- package the csa2 CUDA sources (attn_cuda / topk_cuda were not installed)
-- prefill: count routed pairs without torch.bincount's host sync
-- /health and /metrics: drafted_total / accepted_total from the DSpark and
-  lookup drafts (were always 0 for this family)
-- TF_DSV41_PREFILL_PROFILE: an opt-in profile of one prompt prefill
-- tests/test_dsv41_tp4.py: four ranks on threads (uneven partitions, == one
-  rank in exact numerics, ranks agree bit for bit, row invariance, greedy
-  over uneven vocabulary slices, Engram from of4 shards)
+The four-Spark layer of this fork, on jayleaton's G19 (patches 0001/0002,
+engine 7bd2d67): what 0003-0006 were on G13, merged onto G19, plus the
+N-rank ports of G16-G19 features that assumed two ranks (fail-fast over
+one fate channel per follower, the memory floor on the tightest
+follower, the plan link (rdma stays two-rank; tcp with the rank
+handshake at four), image segments kept out of the prompt pipeline, the
+vision budget on rank 0 alone).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- pyproject.toml                                |   1 +
- src/tensorfold/cli.py                         |  14 +-
- src/tensorfold/cli_args.py                    |   6 +-
- .../families/deepseek_v41/__init__.py         |   8 +-
- .../families/deepseek_v41/cuda/batch.py       |   5 +-
- .../families/deepseek_v41/cuda/blocks.py      |   2 +-
- .../families/deepseek_v41/cuda/calib.py       |   4 +-
- .../families/deepseek_v41/cuda/engine.py      |  60 ++++---
- .../families/deepseek_v41/cuda/experts.py     |  28 +--
- .../families/deepseek_v41/cuda/gate.py        |  11 +-
- .../families/deepseek_v41/cuda/planlink.py    |  41 +++--
- .../families/deepseek_v41/cuda/slots.py       |  58 ++++++-
- .../families/deepseek_v41/cuda/weights.py     |  52 ++++--
- .../families/deepseek_v41/cuda/x3gm.py        |  11 +-
- .../families/deepseek_v41/cuda/x3tc.py        |   4 +-
- .../families/glm5_next/spark/roce.cpp         |   7 +-
- tests/test_dsv41_tp4.py                       | 160 ++++++++++++++++++
- 17 files changed, 372 insertions(+), 100 deletions(-)
- create mode 100644 tests/test_dsv41_tp4.py
-
-diff --git a/pyproject.toml b/pyproject.toml
-index 747b44a..39f01a8 100644
---- a/pyproject.toml
-+++ b/pyproject.toml
-@@ -61,6 +61,7 @@ where = ["src"]
- "tensorfold.families.glm5_next.cuda" = ["*.cu", "*.cpp"]
- "tensorfold.families.glm5_next.spark" = ["*.cu", "*.cpp", "*.h", "*.txt"]
- "tensorfold.families.deepseek_v41.cuda" = ["*.cu", "*.cpp", "*.txt"]
-+"tensorfold.families.deepseek_v41.cuda.csa2" = ["*.cu", "*.cpp"]
- "tensorfold.families.nemotron_h.cuda" = ["*.cu", "*.cpp"]
- "tensorfold.cuda.exl3" = ["*.cu", "*.cuh", "*.cpp"]
- "tensorfold.cuda.nvfp4" = ["*.cu", "*.cpp"]
 diff --git a/src/tensorfold/cli.py b/src/tensorfold/cli.py
-index de51e46..d25a0cb 100644
+index de51e46088c095696c102db66511ad200b04fbd9..1df07ff3b475ca62a0a24caa84fd906350d788a6 100644
 --- a/src/tensorfold/cli.py
 +++ b/src/tensorfold/cli.py
-@@ -232,10 +232,10 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
+@@ -232,10 +232,13 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
  
      from tensorfold import hub
  
@@ -67,6 +25,9 @@ index de51e46..d25a0cb 100644
 -        raise ValueError("--tp 2 needs --master: rank 0's address on the link between the two machines")
 -    if args.tp == 1 and args.rank != 0:
 -        raise ValueError("--rank 1 needs --tp 2")
++    sizes = tuple(getattr(family.package, "CUDA_TP", (1, 2)))     # a family opts in to more ranks (deepseek_v41: 4)
++    if args.tp not in sizes and args.tp > 2:
++        raise ValueError(f"--tp {args.tp}: {family.title} runs with --tp " + " / ".join(str(n) for n in sizes))
 +    if args.tp > 1 and not args.master:
 +        raise ValueError(f"--tp {args.tp} needs --master: rank 0's address on the link between the machines")
 +    if not 0 <= args.rank < args.tp:
@@ -74,7 +35,7 @@ index de51e46..d25a0cb 100644
      started = time.perf_counter()
      drafter = "" if args.no_drafts else _drafter(family, args.drafter)
      options: dict[str, Any] = {"drafter": drafter, "tp": int(args.tp), "rank": int(args.rank), "master": args.master,
-@@ -259,7 +259,7 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
+@@ -259,7 +262,7 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
      if getattr(args, "checkpoint_slots", None) is not None and getattr(family.package, "CUDA_CHECKPOINT_SLOTS", False):
          options["checkpoint_slots"] = int(args.checkpoint_slots)
      served = args.name or (args.model.rstrip("/").split("/")[-1] if hub.is_repo_id(args.model) else model_dir.name)
@@ -83,7 +44,7 @@ index de51e46..d25a0cb 100644
      print(f"[tensorfold] loading {served}: {family.title} ({family.model_type}) on CUDA{where}", flush=True)
      from tensorfold.cuda import prompt_precision
  
-@@ -271,8 +271,8 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
+@@ -271,8 +274,8 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
          raise ValueError("--prefill-fp8: this checkpoint's prompt matmuls have no FP8 kernel (EXL3 packs, MLX formats "
                           "other than Qwen's 4-bit g64, Flash Next without MXFP8 layers); drop the flag")
      stacks.arm()            # its warmup may have loaded a compiler that took USR1
@@ -95,7 +56,7 @@ index de51e46..d25a0cb 100644
          return 0
      from tensorfold.cuda.server import App, serve
 diff --git a/src/tensorfold/cli_args.py b/src/tensorfold/cli_args.py
-index 510e6dc..4e07593 100644
+index 510e6dc2bf7aed572162bef14155433cc2497473..4e075935355fb08a85c1591930dabf702ef92451 100644
 --- a/src/tensorfold/cli_args.py
 +++ b/src/tensorfold/cli_args.py
 @@ -112,10 +112,10 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
@@ -112,11 +73,54 @@ index 510e6dc..4e07593 100644
      cuda.add_argument("--master", default="", help="with --tp 2: rank 0's address on the link between the machines")
      cuda.add_argument("--master-port", type=int, default=29551, help="with --tp 2: rank 0's rendezvous port")
      cuda.add_argument("--kv-dtype", choices=("bf16", "int8", "int4", "fp8"), default="bf16",
+diff --git a/src/tensorfold/cuda/comm.py b/src/tensorfold/cuda/comm.py
+index f29ec25c7432af3282ab78eae211f361b7c6506c..aa67107e75f1c93d4110e5116a50f7680bfac725 100644
+--- a/src/tensorfold/cuda/comm.py
++++ b/src/tensorfold/cuda/comm.py
+@@ -138,6 +138,30 @@ class NCCL:
+         finally:
+             self._check(lib.ncclGroupEnd())
+ 
++    def p2p(self, sends: list, recvs: list) -> None:
++        """Point to point in one NCCL group: each (tensor, peer) of ``sends`` goes to that rank, each (tensor, peer)
++        of ``recvs`` is filled from it (the peers post the matching calls, in the same order)."""
++
++        lib = self.lib
++        if not getattr(self, "_p2p", False):
++            for name in ("ncclSend", "ncclRecv"):
++                getattr(lib, name).argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
++                                               ctypes.c_void_p, ctypes.c_void_p]
++            lib.ncclGroupStart.argtypes = []
++            lib.ncclGroupEnd.argtypes = []
++            self._p2p = True
++        stream = torch.cuda.current_stream().cuda_stream
++        self._check(lib.ncclGroupStart())
++        try:
++            for t, peer in sends:
++                if t.numel():
++                    self._check(lib.ncclSend(t.data_ptr(), t.numel(), _DTYPES[t.dtype], int(peer), self.comm, stream))
++            for t, peer in recvs:
++                if t.numel():
++                    self._check(lib.ncclRecv(t.data_ptr(), t.numel(), _DTYPES[t.dtype], int(peer), self.comm, stream))
++        finally:
++            self._check(lib.ncclGroupEnd())
++
+     def barrier(self) -> None:
+         x = torch.zeros((1,), dtype=torch.float32, device="cuda")
+         y = torch.zeros((self.world,), dtype=torch.float32, device="cuda")
 diff --git a/src/tensorfold/families/deepseek_v41/__init__.py b/src/tensorfold/families/deepseek_v41/__init__.py
-index 7a6e2e2..0f87d36 100644
+index 7a6e2e243c0b8694e691d794ea82983dff689ea3..835a67e365bfaeb35da4c2715be3ee2761e4c525 100644
 --- a/src/tensorfold/families/deepseek_v41/__init__.py
 +++ b/src/tensorfold/families/deepseek_v41/__init__.py
-@@ -77,15 +77,15 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank:
+@@ -24,6 +24,7 @@ MODELS = ("dealignai/DeepSeek-V4.1-Flash-UNCENSORED-EXL3-2.9bpw", "MiaAI-Lab/Dee
+ QUANT_METHODS = {"cuda": ("exl3",)}
+ # The KV cache is the 584-byte FP8 record (``cuda/csa2/rows.py``, the kit's ``fp8_ds_mla``): serve with --kv-dtype fp8
+ CUDA_KV_DTYPES = ("fp8",)
++CUDA_TP = (2, 4)                      # ranks, one a Spark (the CLI refuses --tp 4 for families without it)
+ CACHE_FORMAT = "fp8_ds_mla"
+ DRAFTER = ""                          # DSpark is the checkpoint's own mtp.* blocks (M2), not a separate model
+ REQUIRED_FILES: dict = {}
+@@ -77,15 +78,15 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank:
                  master_port: int = 29551, no_drafts: bool = False, mtp_drafts: int | None = None, **options: Any):
      """The CLI's engine factory (GLM's ``cuda_engine`` signature): TP=2 over two Sparks only."""
  
@@ -137,10 +141,10 @@ index 7a6e2e2..0f87d36 100644
  
  def _has_app() -> bool:
 diff --git a/src/tensorfold/families/deepseek_v41/cuda/batch.py b/src/tensorfold/families/deepseek_v41/cuda/batch.py
-index 93c0e18..fc4c60d 100644
+index 9325c1a7a108daae2a8fa784a782cbab1c298b59..04dffa0b28f21708b215b5e5a417b9138680512f 100644
 --- a/src/tensorfold/families/deepseek_v41/cuda/batch.py
 +++ b/src/tensorfold/families/deepseek_v41/cuda/batch.py
-@@ -472,7 +472,10 @@ class Batcher:
+@@ -629,7 +629,10 @@ class Batcher:
          s.job.stats.update(finish="cancelled" if cancelled else "done", completion=len(s.out),
                             decode_s=round(dt, 4), rounds=self.rounds)
          if s.plan is not None:
@@ -153,10 +157,10 @@ index 93c0e18..fc4c60d 100644
  
      def _fail_all(self, exc: BaseException) -> None:
 diff --git a/src/tensorfold/families/deepseek_v41/cuda/blocks.py b/src/tensorfold/families/deepseek_v41/cuda/blocks.py
-index 3562581..b0ff803 100644
+index 2bff11c8d910a8cc4de444e3f7b6447350783e32..03aa8de330ec0842cd9e98b4ebf28f6ced25be3e 100644
 --- a/src/tensorfold/families/deepseek_v41/cuda/blocks.py
 +++ b/src/tensorfold/families/deepseek_v41/cuda/blocks.py
-@@ -158,7 +158,7 @@ def gpu_experts(cfg: Config, m, layer: int, world: int, device):
+@@ -161,7 +161,7 @@ def gpu_experts(cfg: Config, m, layer: int, world: int, device):
      down = triples(m.w2, [s[1] for s in m.shared])
      _, topk = cfg.experts_of(layer)
      geom = X.Geometry(dims=cfg.hidden_size, inter=cfg.moe_intermediate_size, experts=m.w1.trellis.shape[0],
@@ -165,11 +169,83 @@ index 3562581..b0ff803 100644
      return X.Experts(x3.prepare(gate, up, down, m.w1.codebook, device=device), geom, keep=[m])
  
  
+@@ -178,6 +178,10 @@ class Context:
+         self.sel = None                 # (selection int32 [n, topk], counts int32 [n]) of the latest index source
+         self.cand = None                # layer 20's candidate blocks for these rows
+         self.proj: dict = {}            # ratio-2 kv source -> its [kv | score] projection rows [n, 2 D]
++        self.split = None               # ``Forward.RowSplit`` (TF_DSV41_INDEX_SPLIT): a prefill segment's selections
++        # computed for a quarter of the rows a rank and gathered (rows are independent: the same selections)
++        self.prior = None               # the segment just before these rows when its ``keep`` has not run yet (an
++        # overlapped prefill's first half, ``Forward._run_overlap``): its last projection row is the ratio-2 carry
+         self.lo = torch.zeros((win.n,), dtype=torch.int32, device=win.positions.device)
+ 
+ 
+@@ -316,7 +320,7 @@ def _compress(blk: Block, ctx: Context, table, proj: torch.Tensor) -> None:
+         if win.rows:            # row mode: [every slot's carry | the rows]; ``win.prev`` names each row's pair
+             buf = torch.cat([slot.carry[L], proj], 0)
+         else:
+-            buf = torch.cat([slot.carry[L].view(1, -1), proj], 0)       # the carry: position start - 1
++            buf = torch.cat([carry_of(ctx, L).view(1, -1), proj], 0)    # the carry: position start - 1
+         ctx.proj[L] = proj
+     else:
+         buf = proj
+@@ -325,6 +329,16 @@ def _compress(blk: Block, ctx: Context, table, proj: torch.Tensor) -> None:
+     cs.index_k(A.ix_wk(lat, N.ACT), A.ix_knorm, table, slot.ikeys[L], win, r, cfg.rms_norm_eps)
+ 
+ 
++def carry_of(ctx: Context, L: int) -> torch.Tensor:
++    """Layer L's ratio-2 carry for a segment: the slot's (``keep`` stored it), or the last projection row of the
++    segment just before (``Context.prior``), in the carry's dtype (what ``keep`` would store)."""
++
++    c = ctx.slot.carry[L]
++    if ctx.prior is None:
++        return c
++    return ctx.prior.proj[L][-1].to(c.dtype)
++
++
+ def stage_rows(dst, dst_ring: int, src, src_ring: int, lo: int, hi: int) -> None:
+     """The SWA rows of positions [lo, hi) from one ring into another (stored bytes, device indices)."""
+ 
+@@ -369,6 +383,9 @@ def _select(blk: Block, ctx: Context, qi, w) -> None:
+         if cfg.is_candidate_source(L):
+             sel, ctx.cand = cs.select_cand(qi, w, keys, win, blk.ratio, cfg.index_topk,
+                                            cfg.candidate_block_size, cfg.candidate_topk_blocks)
++        elif ctx.split is not None and ctx.split.takes(win):
++            sel = ctx.split.select(lambda a, b: cs.select(qi[a:b], w[a:b], keys, win.sub(a, b), blk.ratio,
++                                                         cfg.index_topk)[0], win.n)
+         else:
+             sel, _ = cs.select(qi, w, keys, win, blk.ratio, cfg.index_topk)
+     ctx.sel = (sel, visible_counts(sel, win, blk.ratio))
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/branches.py b/src/tensorfold/families/deepseek_v41/cuda/branches.py
+index 833b8e73f5535e726f8ec4d3c1dcb707618a7b2c..55b8b9f6a95075b2ff7940a08cf1b9c043322d28 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/branches.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/branches.py
+@@ -465,17 +465,18 @@ def proj_rows(blk, x: torch.Tensor) -> torch.Tensor:
+ def compress(blk, ctx, table, proj: torch.Tensor) -> None:
+     """``blocks._compress`` on ACT projection rows: the carry through its own pointer where the backend has it."""
+ 
++    from . import blocks as B
+     from . import numerics as N
+ 
+     cfg, A, win, cs, slot, L, r = blk.cfg, blk.attn, ctx.win, ctx.csa2, ctx.slot, blk.index, blk.ratio
+     if r == 2:
+         ctx.proj[L] = proj
+     if hasattr(cs, "pool_norm_split"):
+-        lat = cs.pool_norm_split(slot.carry[L] if r == 2 else None, proj, A.comp_norm, win, r, cfg.rms_norm_eps)
++        lat = cs.pool_norm_split(B.carry_of(ctx, L) if r == 2 else None, proj, A.comp_norm, win, r, cfg.rms_norm_eps)
+     else:                                           # the CPU twin: the concatenated fp32 buffer
+         p = proj.to(N.ACC)
+         if r == 2:
+-            c = slot.carry[L]
++            c = B.carry_of(ctx, L)
+             p = torch.cat([c if win.rows else c.view(1, -1), p], 0)
+         lat = cs.pool_norm(p.contiguous(), A.comp_norm, win, r, cfg.rms_norm_eps)
+     cs.kv_store(lat, table, slot.comp[L], win, r)
 diff --git a/src/tensorfold/families/deepseek_v41/cuda/calib.py b/src/tensorfold/families/deepseek_v41/cuda/calib.py
-index 799dda1..7bf9782 100644
+index 61c81e7f8753708a9e931bc720bebfb0dc961f61..e47ad74ba827d36339b2d291398b15b64cb99b2d 100644
 --- a/src/tensorfold/families/deepseek_v41/cuda/calib.py
 +++ b/src/tensorfold/families/deepseek_v41/cuda/calib.py
-@@ -245,8 +245,8 @@ def costs_for(fw, eng, *, ensure, image: str, shape: dict, sync) -> Costs:
+@@ -501,8 +501,8 @@ def costs_for(fw, eng, *, ensure, image: str, shape: dict, sync) -> Costs:
      ids = eng._share(prompt_ids(eng.model_dir, fw.vocab) if eng.rank == 0 else None)
  
      def gather_max(vals: list) -> list:
@@ -180,11 +256,152 @@ index 799dda1..7bf9782 100644
  
      from .joint import rows_cap
  
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/csa2/attn_pf.py b/src/tensorfold/families/deepseek_v41/cuda/csa2/attn_pf.py
+index 3adedb62c0506244cc79789aa9d2d596e9284954..5cf652268b4f469bee2e6963e45bfca082d45233 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/csa2/attn_pf.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/csa2/attn_pf.py
+@@ -49,13 +49,17 @@ def variant() -> int:
+     return PM.attn_variant()
+ 
+ 
+-def config() -> tuple[int, int]:
+-    """(BMQ heads a program, warps): ``TF_DSV41_PREFILL_ATTN_BMQ`` (16 / 32), ``TF_DSV41_PREFILL_ATTN_WARPS`` (8)."""
++def config(heads: int | None = None) -> tuple[int, int]:
++    """(BMQ heads a program, warps): ``TF_DSV41_PREFILL_ATTN_BMQ`` (16 / 32), ``TF_DSV41_PREFILL_ATTN_WARPS`` (8).
++    With ``heads`` (a rank's query heads): BMQ 32 on a rank with 16 heads (TP=4) is clamped to 16, the same kernel
++    one tile a program, instead of the chunk kernels' fallback (a two-Spark prod.env on four Sparks)."""
+ 
+     bmq = int(os.environ.get("TF_DSV41_PREFILL_ATTN_BMQ", "") or 16)
+     warps = int(os.environ.get("TF_DSV41_PREFILL_ATTN_WARPS", "") or 8)
+     if bmq not in (16, 32) or warps not in (4, 8, 16):
+         raise ValueError(f"TF_DSV41_PREFILL_ATTN_BMQ={bmq} (16 / 32), TF_DSV41_PREFILL_ATTN_WARPS={warps} (4 / 8 / 16)")
++    if heads is not None and heads % bmq and heads % 16 == 0:
++        bmq = 16
+     return bmq, warps
+ 
+ 
+@@ -127,7 +131,7 @@ def attention(q: torch.Tensor, comp, tokens: torch.Tensor | None, counts: torch.
+     group-major bf16 [groups, R, H / groups x 512] contiguous, the same values."""
+ 
+     R, H, _ = q.shape
+-    bmq, warps = config()
++    bmq, warps = config(H)
+     if H % bmq or not q.is_contiguous() or q.dtype != torch.bfloat16 or q.shape[2] != D:
+         raise ValueError(f"attn_pf: q bf16 [R, H, 512] contiguous with H a multiple of {bmq}")
+     hg = 0
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/csa2/backend.py b/src/tensorfold/families/deepseek_v41/cuda/csa2/backend.py
+index dd80d93d277ac515a5f8f2f0d7589d1df437b4ac..11895fe7b19d3131d628b58b1da01fd6dc4fc0b2 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/csa2/backend.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/csa2/backend.py
+@@ -173,12 +173,13 @@ def index_kv() -> str:
+     return v
+ 
+ 
+-def _pf_bmq() -> int:
+-    """attn_pf's heads a program: a head count it does not divide (synthetic checkpoints) keeps the chunk kernels."""
++def _pf_bmq(heads: int | None = None) -> int:
++    """attn_pf's heads a program for ``heads`` (clamped to 16 at TP=4): a head count it does not divide (synthetic
++    checkpoints) keeps the chunk kernels."""
+ 
+     from . import attn_pf
+ 
+-    return attn_pf.config()[0]
++    return attn_pf.config(heads)[0]
+ 
+ 
+ def fused_prefill() -> bool:
+@@ -395,7 +396,7 @@ class Triton:
+         [groups, R, H / groups x 512] (``wo_a``'s groups read contiguous slices); None where that path does not run
+         (the caller takes ``attention``). The same values as ``attention``'s."""
+ 
+-        if win.rows or not fused_prefill() or q.shape[1] % _pf_bmq() or groups < 1 or q.shape[1] % groups:
++        if win.rows or not fused_prefill() or q.shape[1] % _pf_bmq(q.shape[1]) or groups < 1 or q.shape[1] % groups:
+             return None
+         from . import attn_pf
+ 
+@@ -419,7 +420,7 @@ class Triton:
+         rows = comp.kernel() if comp is not None else None
+         sink = sink.to(F32).contiguous()
+         # G7: fast prefill runs, every row of the run in one pass
+-        if hi is None and not win.rows and fused_prefill() and q.shape[1] % _pf_bmq() == 0:
++        if hi is None and not win.rows and fused_prefill() and q.shape[1] % _pf_bmq(q.shape[1]) == 0:
+             from . import attn_pf
+ 
+             return attn_pf.attention(q, rows, sel, counts, swa.kernel(), lo, win.t, sink, table.cs, out, ring=ring,
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/decode.py b/src/tensorfold/families/deepseek_v41/cuda/decode.py
+index 639a71bd18490b78b5146dd7402ab29d8bacecc2..16b71abd2e4512f35bbbc05a8d1e3cf76edc376e 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/decode.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/decode.py
+@@ -325,6 +325,7 @@ class DecodeForward(SlotsForward):
+         pre = None                              # G17 ``nucleus.Pre`` (TF_DSV41_SPEC_NUCLEUS)
+         segs = [Seg(w.slot, w.start, tuple(w.tokens)) for w in list(windows) + extra]
+         sizes = [len(w.tokens) for w in list(windows) + extra]
++        self.cand_reserve(sum(sizes), count)    # before the forward: no pinned allocation while it may wait on Engram
+         with PH("forward"):
+             logits = self.graphs.run(segs) if self.graphs is not None else self.run(segs)
+         with PH("candidates"):
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/draft_head.py b/src/tensorfold/families/deepseek_v41/cuda/draft_head.py
+index 1f17989b3da01bd18e571570abcbeb978f4908e6..606871b1e36ba119766ec3e245e9e38c40fe04b4 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/draft_head.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/draft_head.py
+@@ -254,12 +254,17 @@ class DraftHead:
+         if self.mode == "trim":
+             order = [i for i in ranking(st.vocab) if 0 <= i < V]
+             self.digest = hashlib.sha256(np.asarray(order, dtype=np.int64).tobytes()).hexdigest()[:12]
+-            lists = [per_rank(order, r * n, min(V, (r + 1) * n), st.rows) for r in range(world)]
+-            if len({len(x) for x in lists}) != 1:
+-                raise ValueError("draft head: the ranks' lists differ in length (an uneven vocabulary split)")
++            from .weights import block_bounds
++
++            spans = [block_bounds(V, world, r) for r in range(world)]     # the head's 128-block column slices
++            if spans[fw.rank] != (fw.vocab_lo, fw.vocab_lo + n):
++                raise ValueError(f"draft head: rank {fw.rank}'s columns are {fw.vocab_lo} .. {fw.vocab_lo + n - 1}, "
++                                 f"the vocabulary split says {spans[fw.rank][0]} .. {spans[fw.rank][1] - 1}")
++            lists = [per_rank(order, lo, hi, st.rows) for lo, hi in spans]
++            if len({len(x) for x in lists}) != 1:     # every rank sends the same candidates a row (one gather)
++                raise ValueError(f"draft head: TF_DSV41_DRAFT_HEAD rows {st.rows} exceed the narrowest rank's "
++                                 f"{min(hi - lo for lo, hi in spans)} columns")
+             mine = lists[fw.rank]
+-            if mine.size and (mine[0] < fw.vocab_lo or mine[-1] >= fw.vocab_lo + n):
+-                raise ValueError("draft head: rank r's half is ids r n .. (r + 1) n - 1")
+             listed = np.zeros((V,), dtype=bool)
+             for x in lists:
+                 listed[x] = True
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/dsparkdelta.py b/src/tensorfold/families/deepseek_v41/cuda/dsparkdelta.py
+index 31d0945c05ed2db104440ce15bb2c39837057b15..3ded78e250bdf678f5e29aba3586c4a58c9f109a 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/dsparkdelta.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/dsparkdelta.py
+@@ -50,12 +50,21 @@ def shard(kind: str, A: torch.Tensor, B: torch.Tensor, rank: int, world: int) ->
+ 
+     if world <= 1 or kind == "":
+         return A, B
++
++    def span(total: int) -> tuple[int, int]:      # the weights' own split: whole 128-blocks (uneven at TP=4)
++        if total % 128 == 0:
++            from .weights import block_bounds
++
++            return block_bounds(total, world, rank)
++        n = total // world
++        return rank * n, (rank + 1) * n
++
+     if kind == "col":
+-        n = B.shape[0] // world
+-        return A, B[rank * n:(rank + 1) * n]
++        lo, hi = span(B.shape[0])
++        return A, B[lo:hi]
+     if kind == "row":
+-        k = A.shape[1] // world
+-        return A[:, rank * k:(rank + 1) * k], B
++        lo, hi = span(A.shape[1])
++        return A[:, lo:hi], B
+     raise ValueError(kind)
+ 
+ 
 diff --git a/src/tensorfold/families/deepseek_v41/cuda/engine.py b/src/tensorfold/families/deepseek_v41/cuda/engine.py
-index 780d309..9464ede 100644
+index 0e41507a255a529d0116bdc494c4e6e025614704..4648f8cc166781304f4adfe51e44384d2ab64c7b 100644
 --- a/src/tensorfold/families/deepseek_v41/cuda/engine.py
 +++ b/src/tensorfold/families/deepseek_v41/cuda/engine.py
-@@ -125,13 +125,13 @@ def _ints_f64(lo: int, hi: int) -> float:
+@@ -129,13 +129,13 @@ def _ints_f64(lo: int, hi: int) -> float:
  
  
  class Dsv41Engine:
@@ -200,8 +417,8 @@ index 780d309..9464ede 100644
          import torch
  
          from . import weights as W
-@@ -148,6 +148,10 @@ class Dsv41Engine:
-         hostmem.numpy_hugepages()           # G12: no THP faults (direct compaction) on NumPy's buffers
+@@ -157,6 +157,10 @@ class Dsv41Engine:
+             sys.setswitchinterval(float(sw) / 1000)
          self.torch = torch
          self.model_dir, self.rank = Path(model_dir), rank
 +        world = int(getattr(comm, "world", world) if comm is not None else world)
@@ -211,7 +428,7 @@ index 780d309..9464ede 100644
          self.master, self.port = master, int(port)        # the plan link's address (``planlink``, TF_DSV41_PLAN_LINK)
          self.serial_only, self.draft_depth = serial_only, draft_depth
          self.request = threading.local()
-@@ -175,26 +179,27 @@ class Dsv41Engine:
+@@ -190,11 +194,11 @@ class Dsv41Engine:
              from tensorfold.cuda.comm import NCCL
              from tensorfold.families.glm5_next.spark.roce import select
  
@@ -224,20 +441,20 @@ index 780d309..9464ede 100644
 +        fastboot.mark(f"NCCL ({world} ranks up)")
          tmap, tm_ident = token_map_for(self.model_dir, cfg)
          from . import prefill_mm
- 
+         from . import vision as vision_mod
+@@ -203,15 +207,16 @@ class Dsv41Engine:
          mine = [context, chunk, int(serial_only), int(tm_ident[:7], 16), parallel, int(serving), pchunk,
-                 prefill_mm.tag_grid()]
+                 prefill_mm.tag_grid(), int(bool(bias_vl))]
          both = self._gather_ints(mine)
 -        if both[0] != both[1]:
 -            raise RuntimeError(f"the two ranks were started with different settings (context, TF_DSV41_CHUNK, "
 +        if any(b != both[0] for b in both):
 +            raise RuntimeError(f"the ranks were started with different settings (context, TF_DSV41_CHUNK, "
                                 f"--no-drafts, Engram token map, --parallel, TF_DSV41_SERVING, "
--                               f"TF_DSV41_PREFILL_CHUNK, TF_DSV41_PREFILL_KERNELS / FAST_EXPERTS): rank 0 {both[0]}, "
--                               f"rank 1 {both[1]}")
+                                f"TF_DSV41_PREFILL_CHUNK, TF_DSV41_PREFILL_KERNELS / FAST_EXPERTS, "
+-                               f"TF_DSV41_BIAS_VL set): rank 0 {both[0]}, rank 1 {both[1]}")
 -        key = fastboot.weights_key(self.model_dir, rank, 2, device=device, extra={"token_map": tm_ident})
-+                               f"TF_DSV41_PREFILL_CHUNK, TF_DSV41_PREFILL_KERNELS / FAST_EXPERTS): "
-+                               + "; ".join(f"rank {r} {b}" for r, b in enumerate(both)))
++                               f"TF_DSV41_BIAS_VL set): " + "; ".join(f"rank {r} {b}" for r, b in enumerate(both)))
 +        key = fastboot.weights_key(self.model_dir, rank, world, device=device, extra={"token_map": tm_ident})
  
          def build():
@@ -247,7 +464,7 @@ index 780d309..9464ede 100644
  
          tree = fastboot.cached_tree("weights", key, build, device)
          fastboot.mark("weights", f"{tree.nbytes() / 1e9:.1f} GB")
-@@ -203,16 +208,16 @@ class Dsv41Engine:
+@@ -220,16 +225,16 @@ class Dsv41Engine:
          engram_dir = os.environ.get("TF_DSV41_ENGRAM_DIR", "").strip()
          if not engram_dir:
              raise ValueError("TF_DSV41_ENGRAM_DIR: the kit's packed per-rank Engram shards on this node's NVMe "
@@ -268,7 +485,24 @@ index 780d309..9464ede 100644
              self.fw = decode.make(cfg, tree, loader=loader, **fw_args, cached=lambda b: fastboot.cached_tree(
                  "dspark", {**key, "part": "dspark"}, b, device))
          else:
-@@ -248,7 +253,7 @@ class Dsv41Engine:
+@@ -254,6 +259,16 @@ class Dsv41Engine:
+             fastboot.mark("forward built", f"{torch.cuda.memory_allocated() / 2 ** 30:.1f} GiB allocated")
+         if serving:
+             self._serve(parallel, device)
++            from . import pipe as PP
++
++            prows = PP.rows_min()
++            if prows > 0 and self.world > 1:        # TF_DSV41_PREFILL_PIPE: the stages' full-width encoder layers
++                self.fw.pipe = PP.Pipeline(self.fw, self.model_dir, prows)
++                if cuda:
++                    torch.cuda.empty_cache()
++                fastboot.mark("pipeline", f"{self.fw.pipe.describe()}; "
++                              f"{torch.cuda.memory_allocated() / 2 ** 30 if cuda else 0:.1f} GiB allocated")
++            self.fw.cand_warm()             # every candidate width's kernels loaded before serving (slots.py)
+             if callable(getattr(self.fw, "boot", None)):
+                 self.fw.boot(self)          # graph warm-up (15 s budget), the cost table (cached per image / shape)
+                 fastboot.mark("M2 boot", self.fw.describe())
+@@ -283,7 +298,7 @@ class Dsv41Engine:
          from .stack import build
  
          topo = topology.load(self.model_dir)
@@ -277,7 +511,16 @@ index 780d309..9464ede 100644
          self.batch, self.grammar_host = build(self.fw, topo, rank=self.rank, link=link, model_dir=self.model_dir,
                                                eos=self.eos, slots=parallel, context=self.limit, device=device,
                                                image=code_digest(), start=False)
-@@ -260,22 +265,24 @@ class Dsv41Engine:
+@@ -293,7 +308,7 @@ class Dsv41Engine:
+         # TF_DSV41_FAILFAST (1): a failure in one rank's round ends both ranks in ~1 s (exit 70), every request 500;
+         # rank 1 reports its usable memory to rank 0's floor over the same channel (the plan link's TCP connection)
+         self.fate = failfast.attach(self.batch, link, rank=self.rank, master=self.master, port=self.port,
+-                                    rt=getattr(self.comm, "rt", None))
++                                    rt=getattr(self.comm, "rt", None), world=self.world)
+         disk = getattr(self.store, "disk", None)
+         n = self._gather_ints([int(disk is not None)])
+         if disk is None or not all(v[0] for v in n):
+@@ -301,22 +316,24 @@ class Dsv41Engine:
          raw = json.dumps(disk.keys()).encode()
          words = pack_bytes(raw)
          lens = self._gather_ints([len(raw), len(words)])
@@ -309,9 +552,14 @@ index 780d309..9464ede 100644
  
      def _share(self, values: list[int] | None) -> list[int]:
          """Rank 0's int list on both ranks (its length, then the values)."""
-@@ -300,12 +307,13 @@ class Dsv41Engine:
-         vals, ids = P.top(logits.float(), k)       # ties: the lower id (the kit's argmax)
-         ids = (ids + self.fw.vocab_lo).to(torch.int32)
+@@ -337,16 +354,17 @@ class Dsv41Engine:
+         torch = self.torch
+         greedy = sampling is None or sampling.temperature <= 0
+         k = 1 if greedy else (int(sampling.top_k) + MARGIN if sampling.top_k else NUCLEUS_CANDIDATES)
+-        k = min(k, logits.shape[1])
+-        vals, ids = P.top(logits.float(), k)       # ties: the lower id (the kit's argmax)
+-        ids = (ids + self.fw.vocab_lo).to(torch.int32)
++        vals, ids, k = P.rank_top(logits.float(), k, self.fw.vocab_lo, self.fw.vocab_wide)   # one k on every rank
          packed = torch.cat([vals, ids.view(torch.float32)], 1).contiguous()
 -        got = torch.empty((2 * packed.numel(),), dtype=torch.float32, device=logits.device)
 +        w = self.world
@@ -324,11 +572,13 @@ index 780d309..9464ede 100644
 -        tokens = torch.cat([g[r, :, k:].contiguous().view(torch.int32) for r in range(2)], 1).numpy().astype(np.int64)
 +        values = torch.cat([g[r, :, :k] for r in range(w)], 1).numpy().astype(np.float32)
 +        tokens = torch.cat([g[r, :, k:].contiguous().view(torch.int32) for r in range(w)], 1).numpy().astype(np.int64)
++        real = tokens[0] != P.PAD                   # a narrower slice's padding (the same columns in every row)
++        values, tokens = values[:, real], tokens[:, real]
          if greedy:
              order = np.lexsort((tokens, -values), axis=-1)
              return [int(tokens[i, order[i, 0]]) for i in range(logits.shape[0])]
 diff --git a/src/tensorfold/families/deepseek_v41/cuda/experts.py b/src/tensorfold/families/deepseek_v41/cuda/experts.py
-index df1a426..11caae9 100644
+index df1a426f03002b54d04cbf7e9f4ab231ea6da851..11caae95d130697f8f624af00d06ce3fe1191aaa 100644
 --- a/src/tensorfold/families/deepseek_v41/cuda/experts.py
 +++ b/src/tensorfold/families/deepseek_v41/cuda/experts.py
 @@ -62,16 +62,22 @@ class Geometry:
@@ -384,8 +634,504 @@ index df1a426..11caae9 100644
      raise ValueError(f"kind must be 'col' or 'row', not {kind!r}")
  
  
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/failfast.py b/src/tensorfold/families/deepseek_v41/cuda/failfast.py
+index 5403ef6b5bee4f1d4d8cb2d39d87d66ed4b681e3..dd41fd249adc457b3d77c63dc015825eb02c7ae7 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/failfast.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/failfast.py
+@@ -46,6 +46,11 @@ engine opens one TCP connection for the channel alone (``TF_DSV41_FATE_PORT``, d
+ Exchanges with the RoCE mailbox's credits were considered and not used: they live in C++ (``roce_msg.h``), a payload
+ there changes the latency-critical path, and they flow only while plans do (an idle rank 0 would see no report).
+ 
++Four ranks (TP=4): rank 0 holds one fate channel per follower (the plan link's connection to each, in rank order).
++A follower's ``FAIL`` or hang-up ends rank 0, whose hang-up then ends every other follower: the whole world goes
++down together, as the pair did. Rank 0's floor reads the tightest follower (``peer_mem``: the smallest last report,
++the oldest of their ages; None until every follower has reported).
++
+ Knobs: ``TF_DSV41_FAILFAST`` (1; 0: the old behaviour: rank 0 fails the round's requests and carries on, rank 1's
+ exception leaves ``follow``), ``TF_DSV41_FAILFAST_GRACE_S`` (1.0), ``TF_DSV41_PEER_MEM_S`` (0.5),
+ ``TF_DSV41_FATE_PORT``, and the test hook ``TF_DSV41_FAILFAST_INJECT=rank:round:phase[:kind]`` (raise once on that
+@@ -141,23 +146,34 @@ class Inject:
+ def conn_of(link) -> socket.socket | None:
+     """The TCP socket behind a plan link (``planlink.TcpLink`` / ``RoceLink``, under ``Pinned``), or None (nccl)."""
+ 
++    conns = conns_of(link)
++    return conns[0] if conns else None
++
++
++def conns_of(link) -> list[socket.socket]:
++    """Every TCP socket behind a plan link: rank 0's one a follower (rank order), a follower's one to rank 0."""
++
+     for _ in range(4):
++        many = getattr(link, "conns", None)
++        if isinstance(many, (list, tuple)) and many and all(isinstance(c, socket.socket) for c in many):
++            return list(many)
+         conn = getattr(link, "conn", None)
+         if isinstance(conn, socket.socket):
+-            return conn
++            return [conn]
+         inner = getattr(link, "tcp", None) or getattr(link, "link", None)
+         if inner is None:
+-            return None
++            return []
+         link = inner
+-    return None
++    return []
+ 
+ 
+ class Channel:
+     """The fate channel over one stream socket: rank 1 writes ``MEM`` / ``FAIL`` frames, rank 0 reads them; either
+     side's hang-up is the other's signal."""
+ 
+-    def __init__(self, rank: int, conn: socket.socket) -> None:
++    def __init__(self, rank: int, conn: socket.socket, peer: int | None = None) -> None:
+         self.rank, self.conn = int(rank), conn
++        self.peer = (0 if self.rank else 1) if peer is None else int(peer)       # the rank at the other end
+         self.lock = threading.Lock()
+         self.sent = 0
+ 
+@@ -212,7 +228,7 @@ class Channel:
+             return None
+         magic, kind, value = _FRAME.unpack(head)
+         if magic != MAGIC:
+-            return FAIL, 0, f"rank 1 sent a frame that is not the fate channel's (magic {magic:#x})"
++            return FAIL, 0, f"rank {self.peer} sent a frame that is not the fate channel's (magic {magic:#x})"
+         text = ""
+         if kind == FAIL and value > 0:
+             body = self._exact(min(int(value), 4000))
+@@ -247,10 +263,12 @@ class Fate:
+     """One rank's side: ``fatal`` (this rank failed), the fate thread (the peer failed or left), ``peer_mem`` (rank 0:
+     rank 1's last report). ``on_fail``: callbacks given the reason (rank 0's batcher fails its requests)."""
+ 
+-    def __init__(self, rank: int, chan: Channel | None, *, rt=None, exit_fn: Callable[[int], None] | None = None,
++    def __init__(self, rank: int, chan: Channel | list[Channel] | None, *, rt=None, exit_fn: Callable[[int], None] | None = None,
+                  grace_s: float | None = None, report_s: float | None = None,
+                  usable: Callable[[], int] | None = None, out=None) -> None:
+-        self.rank, self.chan, self.rt = int(rank), chan, rt
++        self.rank, self.rt = int(rank), rt
++        self.chans: list[Channel] = [] if chan is None else (list(chan) if isinstance(chan, (list, tuple)) else [chan])
++        self.chan = self.chans[0] if self.chans else None
+         self.exit_fn = exit_fn or os._exit
+         self.grace_s = _f("TF_DSV41_FAILFAST_GRACE_S", 1.0, 0.0, 60.0) if grace_s is None else float(grace_s)
+         self.report_s = _f("TF_DSV41_PEER_MEM_S", 0.5, 0.01, 60.0) if report_s is None else float(report_s)
+@@ -259,25 +277,47 @@ class Fate:
+         self.on_fail: list[Callable[[str], None]] = []
+         self.dead: str | None = None             # the reason, once the pair is going down
+         self.code: int | None = None             # the exit code asked for (tests: exit_fn returns)
+-        self.peer: tuple[int, float] | None = None    # rank 1's usable bytes, monotonic time of the report
++        self.peers: dict[int, tuple[int, float]] = {}  # follower -> (usable bytes, monotonic time of its report)
+         self.reports = 0
+         self.closing = False                     # a normal stop: the peer's hang-up is not a failure
+         self.done = threading.Event()            # set once ``_die`` asked for the exit
+         self._lock = threading.Lock()
+-        self._thread: threading.Thread | None = None
++        self._threads: list[threading.Thread] = []
++
++    @property
++    def peer(self) -> tuple[int, float] | None:
++        """The tightest follower's (usable bytes, monotonic time), once every follower has reported."""
++
++        if not self.chans or len(self.peers) < len(self.chans):
++            return None
++        vals = list(self.peers.values())
++        return min(v[0] for v in vals), min(v[1] for v in vals)
++
++    def tightest(self) -> int | None:
++        """The follower with the smallest last report (None before every follower has reported)."""
++
++        if not self.chans or len(self.peers) < len(self.chans):
++            return None
++        return min(self.peers, key=lambda r: self.peers[r][0])
+ 
+     def start(self) -> Fate:
+-        if self.chan is not None and self._thread is None:
+-            target = self._watch0 if self.rank == 0 else self._watch1
+-            self._thread = threading.Thread(target=target, name=f"dsv41-fate-r{self.rank}", daemon=True)
+-            self._thread.start()
++        if self.chans and not self._threads:
++            for chan in self.chans:
++                if self.rank == 0:
++                    t = threading.Thread(target=self._watch0, args=(chan,), daemon=True,
++                                         name=f"dsv41-fate-r0-{chan.peer}")
++                else:
++                    t = threading.Thread(target=self._watch1, args=(chan,), daemon=True, name=f"dsv41-fate-r{self.rank}")
++                t.start()
++                self._threads.append(t)
+         return self
+ 
+     def peer_mem(self) -> tuple[int, float] | None:
+-        """(rank 1's usable bytes, seconds since its report), or None before the first report."""
++        """(the tightest follower's usable bytes, seconds since the oldest report), or None before every follower
++        has reported."""
+ 
+         p = self.peer
+-        return None if p is None else (p[0], time.monotonic() - p[1])
++        return None if p is None else (p[0], time.monotonic() - p[1], self.tightest())
+ 
+     # -- failures ------------------------------------------------------------------------------------------------
+     def fatal(self, exc: BaseException, where: str) -> None:
+@@ -319,11 +359,11 @@ class Fate:
+                 cb(f"{reason}; both ranks are restarting")
+             except Exception as exc:            # noqa: BLE001
+                 _log(f"rank {self.rank}: failing the requests raised {exc!r}", self.out)
+-        if self.chan is not None:
+-            if self.rank == 1 and own:
+-                self.chan.fail(reason)
++        for chan in self.chans:
++            if self.rank != 0 and own:
++                chan.fail(reason)
+             else:
+-                self.chan.hangup()
++                chan.hangup()
+         if self.grace_s > 0:
+             time.sleep(self.grace_s)
+         self.code = EXIT_CODE
+@@ -331,58 +371,62 @@ class Fate:
+         self.exit_fn(EXIT_CODE)
+ 
+     # -- the fate threads ----------------------------------------------------------------------------------------
+-    def _watch0(self) -> None:
++    def _watch0(self, chan: Channel | None = None) -> None:
++        chan = chan or self.chan
+         while self.dead is None:
+-            got = self.chan.read()
++            got = chan.read()
+             if got is None:
+                 if self.closing or self.dead is not None:
+                     return
+-                self.peer_failed("rank 1 closed the fate channel (the process exited or was killed)")
++                self.peer_failed(f"rank {chan.peer} closed the fate channel (the process exited or was killed)")
+                 return
+             kind, value, text = got
+             if kind == MEM:
+-                self.peer = (value, time.monotonic())
++                self.peers[chan.peer] = (value, time.monotonic())
+                 self.reports += 1
+             elif kind == FAIL:
+-                self.peer_failed(text or "rank 1 failed")
++                self.peer_failed(text or f"rank {chan.peer} failed")
+                 return
+ 
+-    def _watch1(self) -> None:
++    def _watch1(self, chan: Channel | None = None) -> None:
++        chan = chan or self.chan
+         while self.dead is None:
+-            if self.chan.hung_up(self.report_s):
++            if chan.hung_up(self.report_s):
+                 if self.closing or self.dead is not None:
+                     return
+                 self.peer_failed("rank 0 closed the fate channel (it failed, exited or was killed)")
+                 return
+             try:
+-                self.chan.report(self.usable())
++                chan.report(self.usable())
+             except Exception:                   # noqa: BLE001  a report must never end the rank
+                 pass
+ 
+ 
+-def attach(batch, link, *, rank: int, master: str, port: int, rt=None, out=None) -> Fate | None:
++def attach(batch, link, *, rank: int, master: str, port: int, rt=None, out=None, world: int = 2) -> Fate | None:
+     """The engine's wiring (``engine._serve``): a ``Fate`` on the plan link's socket (or a TCP connection of its own
+     under ``TF_DSV41_PLAN_LINK=nccl``), started, given to the batcher; rank 0's floor reads rank 1's reports.
+     None with ``TF_DSV41_FAILFAST=0`` (the old behaviour)."""
+ 
+     if not enabled():
+         return None
+-    conn = conn_of(link)
+-    if conn is None:
++    conns = conns_of(link)
++    own = not conns
++    if own:
+         from .planlink import TcpLink, port_for
+ 
+         raw = os.environ.get("TF_DSV41_FATE_PORT", "").strip()
+-        conn = TcpLink(rank, master, int(raw) if raw else port_for(port) + 1).conn
+-    fate = Fate(rank, Channel(rank, conn), rt=rt, out=out)
++        conns = TcpLink(rank, master, int(raw) if raw else port_for(port) + 1, world=world).conns
++    peers = list(range(1, 1 + len(conns))) if rank == 0 else [0]
++    fate = Fate(rank, [Channel(rank, c, p) for c, p in zip(conns, peers)], rt=rt, out=out)
+     batch.fate = fate
+     if rank == 0:
+         fate.on_fail.append(batch.fail_everything)
+         if getattr(batch, "floor", None) is not None:
+             batch.floor.peer = fate.peer_mem
+     fate.start()
+-    _log(f"rank {rank}: on (fate channel {'the plan link' if conn_of(link) is not None else 'its own TCP'}; exit "
+-         f"{EXIT_CODE} after {fate.grace_s:g} s; rank 1 reports memory every {fate.report_s:g} s)", out)
++    _log(f"rank {rank}: on ({len(fate.chans)} fate channel(s) over {'its own TCP' if own else 'the plan link'}; "
++         f"exit {EXIT_CODE} after {fate.grace_s:g} s; followers report memory every {fate.report_s:g} s)", out)
+     return fate
+ 
+ 
+-__all__ = ["Channel", "EXIT_CODE", "Fate", "Inject", "Injected", "attach", "conn_of", "enabled", "local_usable"]
++__all__ = ["Channel", "EXIT_CODE", "Fate", "Inject", "Injected", "attach", "conn_of", "conns_of", "enabled", "local_usable"]
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/forward.py b/src/tensorfold/families/deepseek_v41/cuda/forward.py
+index 644a0a14c133aff8d9805818eaf6f7912b70965f..95cd635f578193eb8aaeccf1303e918a5318f250 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/forward.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/forward.py
+@@ -119,6 +119,32 @@ class LocalComm:
+         recv.copy_(send.reshape(-1))
+ 
+ 
++class RowSplit:
++    """``TF_DSV41_INDEX_SPLIT=<rows>`` (0: off): an index layer's selection of a prefill segment of at least that many
++    rows runs on a quarter of the rows a rank (rank r: rows [r n // W, (r + 1) n // W)) and the ranks' rows are
++    gathered in rank order. Every rank otherwise computes every row's selection (the indexer's 32 heads are not
++    split); a row's selection depends on that row alone, so the gathered selections are the same."""
++
++    def __init__(self, fw: "Forward", min_rows: int) -> None:
++        self.fw, self.min_rows = fw, max(int(min_rows), fw.world)
++        self.calls = 0              # selections split (tests, logs)
++
++    def takes(self, win) -> bool:
++        return not getattr(win, "rows", False) and win.n >= self.min_rows
++
++    def select(self, fn, n: int) -> torch.Tensor:
++        fw = self.fw
++        W, r = fw.world, fw.rank
++        self.calls += 1
++        cuts = [q * n // W for q in range(W + 1)]               # balanced: every rank holds 1 row or more (n >= W)
++        m = cuts[1] - cuts[0] + (1 if n % W else 0)
++        mine = fn(cuts[r], cuts[r + 1])
++        send = torch.full((m, mine.shape[1]), -1, dtype=mine.dtype, device=mine.device)
++        send[:mine.shape[0]] = mine
++        got = fw.gather_rows(send)
++        return torch.cat([got[q, :cuts[q + 1] - cuts[q]] for q in range(W)])
++
++
+ class Forward:
+     """One rank's forward. ``tree``: this rank's ``weights.RankW``; ``csa2``: ``csa2.backend.Triton`` or
+     ``csa2.twin.Twin``; ``engram_rows``: {layer: row source with ``rows(global ids) -> fp32 [N, 256]``} of this
+@@ -148,6 +174,17 @@ class Forward:
+         # stable addresses inside CUDA graphs). TF_DSV41_DECODE_EXCHANGE=fp32 / TF_DSV41_XCHG_BUFS=0: the old path.
+         self.decode_bf16 = (os.environ.get("TF_DSV41_DECODE_EXCHANGE", "bf16").strip() or "bf16") == "bf16"
+         self.xbufs = (os.environ.get("TF_DSV41_XCHG_BUFS", "1").strip() or "1") != "0"
++        # TF_DSV41_PREFILL_OVERLAP=<rows> (0: off): a prefill segment of at least that many rows runs as two halves,
++        # each half's exchanges behind the other half's compute (``_run_overlap``; the same bits: rows are invariant)
++        self.overlap = int(os.environ.get("TF_DSV41_PREFILL_OVERLAP", "0").strip() or 0)
++        if self.overlap < 0:
++            raise ValueError(f"TF_DSV41_PREFILL_OVERLAP={self.overlap}: expected 0 (off) or the rows a segment")
++        self.overlap_runs = 0       # segments run overlapped (tests, logs)
++        split = int(os.environ.get("TF_DSV41_INDEX_SPLIT", "0").strip() or 0)
++        self.rowsplit = RowSplit(self, split) if split > 0 and self.world > 1 else None
++        self.xstream = None         # the exchange stream (high priority: its few blocks start between compute's)
++        if self.overlap and self.device.type == "cuda" and self.world > 1:
++            self.xstream = torch.cuda.Stream(self.device, priority=-1)
+         self._recv: dict = {}       # (dtype, device) -> [capacity, [buffer, buffer], parity]
+         self._retired: list = []    # outgrown receive buffers: a captured graph may still write them
+         self.ring = next_pow2(chunk + cfg.sliding_window - 1)
+@@ -156,6 +193,7 @@ class Forward:
+         self.tables = tables(cfg, limit + self.pchunk, self.device)
+         self.embed, self.vocab_lo = tree.embed, tree.vocab_lo
+         self.vocab = int(cfg.vocab_size)
++        self.vocab_wide = P.widest(self.vocab, self.world)    # the widest rank's columns (top-k exchanges)
+         self.norm = tree.norm
+         self.head = B.materialize(tree.head, self.device)
+         self.blocks = [B.Block(cfg, lw, self.device, self.world) for lw in tree.layers]
+@@ -299,6 +337,42 @@ class Forward:
+         fast_gather(self.comm, partial.view(-1), recv)
+         return recv.view(self.world, *partial.shape)
+ 
++    def gather_start(self, partial: torch.Tensor):
++        """``gather_partials`` started on the exchange stream (``TF_DSV41_PREFILL_OVERLAP``): returns ``wait()``, which
++        makes the current stream wait for it and returns what ``gather_partials`` would have (the same bits: the same
++        bf16 send buffer, the same all-gather). Only a prefill segment's bf16 exchange runs behind; anything else
++        exchanges at once (``wait`` then just returns it)."""
++
++        world = self.world
++        if not (self.xstream is not None and world > 1 and self.exchange_bf16 and N.KIT_ROUNDING and
++                partial.dtype == torch.float32 and partial.shape[0] > self.chunk):
++            got = self.gather_partials(partial)
++            return lambda: got
++        if self.gather_bf16:
++            half = partial.contiguous().to(torch.bfloat16)
++        else:
++            half = P.kit_partial(partial).contiguous().to(torch.bfloat16)
++        recv = torch.empty((world * half.numel(),), dtype=half.dtype, device=half.device)
++        cur = torch.cuda.current_stream(half.device)
++        ready = torch.cuda.Event()
++        ready.record(cur)
++        xs = self.xstream
++        with torch.cuda.stream(xs):
++            xs.wait_event(ready)
++            fast_gather(self.comm, half.view(-1), recv)
++            done = torch.cuda.Event()
++            done.record(xs)
++        half.record_stream(xs)          # the allocator keeps them until the exchange stream is past them
++        recv.record_stream(xs)
++        shape, widen = partial.shape, not self.gather_bf16
++
++        def wait() -> torch.Tensor:
++            cur.wait_event(done)
++            got = recv.view(world, *shape)
++            return got.to(torch.float32) if widen else got
++
++        return wait
++
+     def _exchange(self, send: torch.Tensor) -> torch.Tensor:
+         """A decode window's contiguous partial [n, D] -> [W, n, D] in rank order, in a persistent receive buffer."""
+ 
+@@ -323,6 +397,24 @@ class Forward:
+         ent[2] ^= 1
+         return ent[1][ent[2]][:numel]
+ 
++    def gather_rows(self, x: torch.Tensor) -> torch.Tensor:
++        """[m, c] a rank -> [W, m, c] in rank order, on the exchange stream when there is one (every all-gather of
++        an overlapped prefill stays on that stream, in program order on every rank)."""
++
++        x = x.contiguous()
++        recv = torch.empty((self.world * x.numel(),), dtype=x.dtype, device=x.device)
++        if self.xstream is None:
++            fast_gather(self.comm, x.view(-1), recv)
++        else:
++            cur = torch.cuda.current_stream(x.device)
++            self.xstream.wait_stream(cur)
++            with torch.cuda.stream(self.xstream):
++                fast_gather(self.comm, x.view(-1), recv)
++            cur.wait_stream(self.xstream)
++            x.record_stream(self.xstream)
++            recv.record_stream(self.xstream)
++        return recv.view(self.world, *x.shape)
++
+     def gather_cols(self, x: torch.Tensor) -> torch.Tensor:
+         """[n, c] a rank -> [n, world c] in rank order."""
+ 
+@@ -393,8 +485,13 @@ class Forward:
+         cfg = self.cfg
+         segs = [sg if isinstance(sg, Seg) else Seg(*sg) for sg in segs]
+         from . import xmap as XM
++        from . import xovl as XO
+ 
+         XM.begin(self, segs, prefill)                       # G15 trace: the window's slots / positions / ids
++        if (prefill and self.overlap and self.world > 1 and len(segs) == 1 and len(segs[0].ids) >= self.overlap
++                and getattr(getattr(self, "static", None), "rowv", None) is None and self.trace is None
++                and not XO.enabled()):                       # G16's split exchanges: one overlap scheme at a time
++            return self._run_overlap(segs[0], logits=logits, upto=upto)
+         most = self.pchunk if prefill else self.chunk
+         rv = getattr(getattr(self, "static", None), "rowv", None)       # row mode (``rowgraphs``): one context
+         ctxs, a, spans = [], 0, []
+@@ -412,6 +509,9 @@ class Forward:
+             spans.append((a, a + n))
+             a += n
+         n = a
++        if prefill and self.rowsplit is not None:
++            for c in ctxs:
++                c.split = self.rowsplit
+         ids_t = self.ids_of(segs)
+         image = None
+         if rv is None and max(max(sg.ids) for sg in segs) >= VBASE:     # image positions (``vision.py``)
+@@ -450,12 +550,92 @@ class Forward:
+             return st
+         return self._finish(st, logits)
+ 
++    def _run_overlap(self, sg: Seg, *, logits: bool, upto: int | None):
++        """A prefill segment as two halves A | B whose blocks interleave (A's sublayer, B's sublayer, ...): each
++        half's exchange runs on the exchange stream while the other half computes. B reads A's rows of a layer
++        (ring, compressed rows, index keys) after A wrote them, and its ratio-2 carry is A's last projection row
++        (``Context.prior``), so every row sees what it sees in one segment: the same bits (row invariance), the same
++        state after ``keep``."""
++
++        cfg, dev = self.cfg, self.device
++        s, n = self.slots[sg.slot], len(sg.ids)
++        if not 2 <= n <= self.pchunk:
++            raise ValueError(f"a segment holds 1 to {self.pchunk} rows, not {n}")
++        if sg.start != s.pos:
++            raise ValueError(f"slot {sg.slot}: a segment at {sg.start}, its position is {s.pos}")
++        if sg.start + n > self.limit:
++            raise ValueError(f"positions up to {sg.start + n} exceed this slot's {self.limit}")
++        h = n // 2
++        self.overlap_runs += 1
++        ids_t = self.ids_of([sg])
++        rows = self._engram_inputs([sg])
++        D, hcm, ops = cfg.hidden_size, cfg.hc_mult, self.hc
++        x = self.embed_rows(ids_t).repeat(1, hcm).contiguous()
++        wants = getattr(ops, "out_of_place", None)
++        sts, ctxs, gens, prior = [], [], [], None
++        for a, b in ((0, h), (h, n)):
++            m = b - a
++            st = Streams(x[a:b].contiguous(), torch.empty((m, D), dtype=N.ACT, device=dev), ops.Scratch(m, dev, D),
++                         [ops.Coefs(m, dev), ops.Coefs(m, dev)])
++            if wants is not None and wants(m):
++                st.alt = torch.empty_like(st.x)
++            c = B.Context(self.win_of(len(ctxs), sg.start + a, m), self.tables, self.csa2, self.ring, s, 0,
++                          self.staging(m))
++            c.prior, prior = prior, c
++            c.split = self.rowsplit
++            sts.append(st)
++            ctxs.append(c)
++            gens.append(self._blocks(st, [c], {L: v[a:b] for L, v in rows.items()}, upto=upto))
++        del x
++        from . import budget as BU
++
++        with BU.window([(0, n)], None, n=n, device=dev, prefill=True):
++            waits, live = [None, None], [True, True]
++            for i, g in enumerate(gens):             # A to its first exchange, then B (A's exchange runs meanwhile)
++                try:
++                    waits[i] = self.gather_start(next(g))
++                except StopIteration:
++                    live[i] = False
++            while any(live):
++                for i, g in enumerate(gens):
++                    if live[i]:
++                        try:
++                            waits[i] = self.gather_start(g.send(waits[i]()))
++                        except StopIteration:
++                            live[i] = False
++        if sts[0].cur != sts[1].cur:
++            raise RuntimeError("overlapped prefill: the halves ended at different sublayers")
++        cat = (lambda ts: torch.cat(ts) if ts[0] is not None else None)                         # noqa: E731
++        taps = {L: cat([t.taps[L] for t in sts]) for L in sts[0].taps}
++        s.pending = Pending(sg.start, list(sg.ids), {L: cat([c.proj[L] for c in ctxs]) for L in ctxs[0].proj}, taps)
++        coefs = [ops.Coefs(n, dev, pre=cat([t.coefs[k].pre for t in sts]), post=cat([t.coefs[k].post for t in sts]),
++                           comb=cat([t.coefs[k].comb for t in sts])) for k in (0, 1)]
++        g0, g1 = sts[0].gathered, sts[1].gathered
++        st = Streams(cat([t.x for t in sts]), cat([t.out for t in sts]), ops.Scratch(n, dev, D), coefs, sts[0].cur,
++                     None if g0 is None else torch.cat([g0, g1], 1), taps)
++        if upto is not None:
++            return st
++        return self._finish(st, logits)
++
+     def _layers(self, st: "Streams", ctxs, rows, *, first: int = 0, upto: int | None = None,
+                 entered: bool = False) -> None:
+         """Blocks ``first``.. over the window's rows. ``upto``: stop at that block once its attention site is computed
+         and its compressor has stored the rows (CED's encoder pass, ``replay``); ``entered``: the first block's site
+         is already in ``st`` (the decoder replay starts at its attention)."""
+ 
++        g = self._blocks(st, ctxs, rows, first=first, upto=upto, entered=entered)
++        try:
++            part = next(g)
++            while True:
++                part = g.send(self.gather_partials(part))
++        except StopIteration:
++            pass
++
++    def _blocks(self, st: "Streams", ctxs, rows, *, first: int = 0, upto: int | None = None, entered: bool = False):
++        """``_layers``' blocks as a generator: it yields each sublayer's partial and resumes with its gathered
++        partials (``_layers`` exchanges at once; ``_run_overlap`` runs two half windows' exchanges behind each
++        other's compute)."""
++
+         from . import l2pf as L2
+         from . import xmap as XM
+         from . import xovl as XO
+@@ -503,7 +683,7 @@ class Forward:
+             L2.mark(blk, "f", n)                # G10 TF_DSV41_L2PF: router + shared expert into L2 during the exchange
+             XM.site(blk, "f", n)                # G15 TF_DSV41_XMAP=prev / both, site f
+             if not xo:
+-                st.gathered = self.gather_partials(part)
++                st.gathered = yield part        # ``_layers`` gathers at once, ``_run_overlap`` behind compute
+             XM.site(blk, "b", n)                # G15 TF_DSV41_XMAP=prev / both, site b (default): beside the boundary
+             hf = ops.Hc(blk.hc_ffn.fn, blk.hc_ffn.base, blk.hc_ffn.scale)
+             dst = x if st.alt is None else st.alt
+@@ -527,7 +707,7 @@ class Forward:
+                 for a, b in XO.spans(n):
+                     st.gathered.send(a, b, part[a:b])
+             else:
+-                st.gathered = self.gather_partials(part)
++                st.gathered = yield part
+             if self.trace is not None:          # the streams after the block: its FFN post applied to a copy
+                 y = x.clone()
+                 if xo:
 diff --git a/src/tensorfold/families/deepseek_v41/cuda/gate.py b/src/tensorfold/families/deepseek_v41/cuda/gate.py
-index 47cf8ff..204d9b8 100644
+index 47cf8ff3b5851172cf248b99fa738c44e299268b..b027d638c500a1de648c3ec54af698729e90b4ce 100644
 --- a/src/tensorfold/families/deepseek_v41/cuda/gate.py
 +++ b/src/tensorfold/families/deepseek_v41/cuda/gate.py
 @@ -67,9 +67,10 @@ class Scorer:
@@ -401,7 +1147,31 @@ index 47cf8ff..204d9b8 100644
  
      def rows(self, logits, kit_top1) -> tuple[list[int], list[list[int]], list[float]]:
          import torch
-@@ -240,14 +241,14 @@ def run(a, comm=None, device: str = "cuda") -> int:
+@@ -86,16 +87,17 @@ class Scorer:
+         at = torch.where(ok, lg.gather(1, local.clamp(0, lg.shape[1] - 1)[:, None])[:, 0],
+                          torch.full_like(lse, float("-inf")))
+         packed = torch.cat([vals, ids.to(torch.float32), lse[:, None], at[:, None]], 1)
+-        g = self._gather(packed).cpu().double()
+-        v = torch.cat([g[0, :, :5], g[1, :, :5]], 1)
+-        t = torch.cat([g[0, :, 5:10], g[1, :, 5:10]], 1).long()
++        g = self._gather(packed).cpu().double()             # [W, R, 12]: every rank's slice, rank order
++        W = g.shape[0]
++        v = torch.cat([g[w, :, :5] for w in range(W)], 1)
++        t = torch.cat([g[w, :, 5:10] for w in range(W)], 1).long()
+         top5, top1 = [], []
+         for r in range(v.shape[0]):
+-            o = sorted(range(10), key=lambda j: (-float(v[r, j]), int(t[r, j])))
++            o = sorted(range(5 * W), key=lambda j: (-float(v[r, j]), int(t[r, j])))
+             top5.append([int(t[r, j]) for j in o[:5]])
+             top1.append(top5[-1][0])
+-        gl = torch.logaddexp(g[0, :, 10], g[1, :, 10])
+-        lp = torch.maximum(g[0, :, 11], g[1, :, 11]) - gl
++        gl = torch.logsumexp(g[:, :, 10], 0)
++        lp = g[:, :, 11].max(0).values - gl
+         return top1, top5, lp.tolist()
+ 
+ 
+@@ -240,14 +242,14 @@ def run(a, comm=None, device: str = "cuda") -> int:
                        f"{bad[:8]}, max |d| {float(d.max()):.3g}", flush=True)
          both = eng._gather_ints(same)
      else:
@@ -419,11 +1189,678 @@ index 47cf8ff..204d9b8 100644
                             "rows": len(ids)},
          "decode_tok_s_median": sorted(tok_s)[len(tok_s) // 2] if tok_s else None,
          "memory": {**mem, "peak_alloc_gib": round(torch.cuda.max_memory_allocated() / 2 ** 30, 2) if cuda else None,
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/memory.py b/src/tensorfold/families/deepseek_v41/cuda/memory.py
+index 3446129163434de8ad0101f808cfb86126149b69..9e2b0e6161a97ac85560c2bc8aeb340a210cf4e4 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/memory.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/memory.py
+@@ -90,7 +90,7 @@ class Budget:
+ def budget(topo: Topology, pack: str = "mia29", *, rank: int = 0, streams: int = 4, context: int = 300_000,
+            index_kv: str = "bf16", workspace: Workspace | None = None, available: float = AVAILABLE) -> Budget:
+     workspace = workspace or Workspace()
+-    w = PACKS[pack][0] - (VISION if rank == 1 else 0.0)
++    w = PACKS[pack][0] - (VISION if rank != 0 else 0.0)      # the vision tower lives on rank 0 alone
+     return Budget(pack, rank, streams, context, index_kv, w, pool_bytes(topo, streams, context, index_kv) / GiB,
+                   streams * slot_bytes(topo).total / GiB, workspace.total, RUNTIME, available)
+ 
+@@ -479,6 +479,12 @@ class Floor:
+         cached = self.cached() if self.cached is not None else 0
+         return memsafe.view(mi.get("MemFree", 0), cached, "available", mi)
+ 
++    def peer_rank(self) -> int:
++        """The follower whose report ``peer_view`` uses (``failfast``'s tightest; 1 at TP=2)."""
++
++        got = self.peer() if self.peer is not None else None
++        return int(got[2]) if got is not None and len(got) > 2 and got[2] is not None else 1
++
+     def peer_view(self) -> int | None:
+         """Rank 1's usable bytes from its last fate-channel report (``failfast``), None when unknown or older than
+         ``peer_stale_s`` (rank 0 alone decides then, as before; logged once an episode)."""
+@@ -489,7 +495,7 @@ class Floor:
+         if got is None or got[1] > self.peer_stale_s:
+             if not self._stale_said:
+                 self._stale_said = True
+-                print(f"[tensorfold] memory floor: rank 1's memory {'unknown' if got is None else f'{got[1]:.0f} s old'}"
++                print(f"[tensorfold] memory floor: the followers' memory {'unknown' if got is None else f'{got[1]:.0f} s old'}"
+                       f"; admission checks rank 0 alone", flush=True)
+             return None
+         self._stale_said = False
+@@ -513,7 +519,7 @@ class Floor:
+         tight, usable = 0, int(v.usable)
+         peer = self.peer_view()
+         if peer is not None and peer < usable:
+-            tight, usable = 1, peer
++            tight, usable = self.peer_rank(), peer
+         if peer is not None and peer < want:
+             ok = False
+             self.stats["peer_waits"] = self.stats.get("peer_waits", 0) + 1
+@@ -524,7 +530,7 @@ class Floor:
+             self.stats["waits"] += 1
+             if peer is not None and peer < want and memsafe.admit_ok(v, 0, want, floor=int(self.free_gib * GiB)):
+                 if self.log.since is None or time.monotonic() - self.log.last >= self.log.every:
+-                    print(f"[tensorfold] admission waits for memory on rank 1 ({queued} queued): usable "
++                    print(f"[tensorfold] admission waits for memory on rank {self.peer_rank()} ({queued} queued): usable "
+                           f"{peer / GiB:.2f} GiB less the prefill price {need / GiB:.2f} is under the "
+                           f"{self.hard_gib:g} GiB hard floor ({HARD_ENV})", flush=True)
+             self.log.waiting(v, 0, want, queued)
+@@ -541,7 +547,7 @@ class Floor:
+         usable, rank = int(self.view().usable), 0
+         peer = self.peer_view()
+         if peer is not None and peer < usable:
+-            rank, usable = 1, peer
++            rank, usable = self.peer_rank(), peer
+         return rank, usable
+ 
+     def fits_idle(self, need: int) -> bool:
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/pick.py b/src/tensorfold/families/deepseek_v41/cuda/pick.py
+index 10cd14264230247e63f6f8e6894bf549ff5ca644..af3fb56bf29ab13074a1fbb7890947f50a944c62 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/pick.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/pick.py
+@@ -83,4 +83,35 @@ def kit_weights(w: torch.Tensor) -> torch.Tensor:
+     return w.to(torch.float16).to(w.dtype)
+ 
+ 
+-__all__ = ["argmax", "keys", "kit_logits", "kit_partial", "kit_weights", "top"]
++PAD = (1 << 31) - 1     # a padded candidate's id: after every real id (``vsample.ID_MAX``), never a token
++
++
++def widest(vocab: int, world: int) -> int:
++    """The widest rank's vocabulary columns (``weights.block_bounds``: rank 0 holds the extra 128-blocks)."""
++
++    if world <= 1:
++        return int(vocab)
++    from .weights import block_bounds
++
++    lo, hi = block_bounds(int(vocab), int(world), 0)
++    return hi - lo
++
++
++def rank_top(lg: torch.Tensor, count: int, lo: int, wide: int) -> tuple[torch.Tensor, torch.Tensor, int]:
++    """This rank's share of a top-``count`` exchange over the ranks' vocabulary slices: (values, int32 ids, k) with
++    the same ``k = min(count, wide)`` on every rank (``wide``: ``widest``), so the all-gather's sizes agree when the
++    slices are uneven (TP=4: 32,384 / 32,384 / 32,256 / 32,256). A narrower slice pads its rows with (-inf, ``PAD``),
++    which sort after every real candidate, -inf ones included; callers take at most the vocabulary's count."""
++
++    k = min(int(count), int(wide))
++    vals, ids = top(lg, k)
++    ids = (ids + lo).to(torch.int32)
++    short = k - vals.shape[-1]
++    if short > 0:
++        R = vals.shape[0]
++        vals = torch.cat([vals, torch.full((R, short), float("-inf"), dtype=vals.dtype, device=vals.device)], 1)
++        ids = torch.cat([ids, torch.full((R, short), PAD, dtype=torch.int32, device=ids.device)], 1)
++    return vals, ids, k
++
++
++__all__ = ["PAD", "argmax", "keys", "kit_logits", "kit_partial", "kit_weights", "rank_top", "top", "widest"]
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/pipe.py b/src/tensorfold/families/deepseek_v41/cuda/pipe.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..65c796fc70473642c8d3b0bf06c651d1c50f1486
+--- /dev/null
++++ b/src/tensorfold/families/deepseek_v41/cuda/pipe.py
+@@ -0,0 +1,528 @@
++# SPDX-License-Identifier: MIT
++"""Pipelined prompt reading (``TF_DSV41_PREFILL_PIPE=<rows>``, 0 = off): CED's encoder pass as an assembly line.
++
++Tensor parallelism splits every layer W ways, yet the indexer (32 heads), the compressor and the single KV head's
++projections, the mHC streams and the selections run in full on every rank, and every sublayer ends in an all-gather.
++Here rank s also holds encoder layers [B[s], B[s + 1]) at full width (a second copy, ~27 GB a rank at W = 4: the
++encoder half of the model) and one prompt's segments flow rank 0 -> W - 1: in pipeline round t, rank s runs segment
++t - s through its layers. The last stage ends at the decoder's first layer's site and compressor (``replay.encode``'s
++``upto``). Decode is unchanged: tensor parallel over the same stores.
++
++Every round ends in one all-gather (``_exchange``) carrying
++- each stage's output for the next: the streams before its last FFN post, that pending post (the gathered partial
++  and its coefficients: the next stage's first mHC boundary applies it, as the next block would in one process), the
++  latest index source's selection;
++- the rows the round wrote into the kv sources' compressed rows and index keys (every rank's stores get them: later
++  stages read them, decode reads them everywhere);
++- the last stage's CED stash rows (``replay.Stash``: the rows entering the decoder).
++Before the prompt's state is read (``finish_prompt``, a snapshot) the line drains (W - 1 rounds without a new
++segment) and each stage's layers' SWA rows and ratio-2 carries go to every rank (``drain``).
++
++Each stage writes its layers' rings, compressed rows, index keys and carries straight into the slot's own stores
++(``Stage.bind``). Exactness: a stage's layers run at world 1, so a pipelined prompt's bits are those of one rank
++computing the encoder (they equal the tensor-parallel bits in exact numerics: ``tests/test_dsv41_pipe.py``); its
++own session tag (``prefill_mm.tag_grid`` + 2).
++"""
++
++from __future__ import annotations
++
++import os
++
++import torch
++
++from tensorfold.cuda.comm import fast_gather
++
++from . import blocks as B
++from . import numerics as N
++from . import replay as RP
++
++
++def rows_min() -> int:
++    """``TF_DSV41_PREFILL_PIPE``: the segment rows that start a pipeline (0: off)."""
++
++    v = int(os.environ.get("TF_DSV41_PREFILL_PIPE", "0").strip() or 0)
++    if v < 0:
++        raise ValueError(f"TF_DSV41_PREFILL_PIPE={v}: expected 0 (off) or the rows a segment that starts a pipeline")
++    return v
++
++
++def _vbase() -> int:
++    from .vision_prep import VBASE
++
++    return int(VBASE)
++
++
++def bounds_for(cfg, world: int) -> list[int]:
++    """Stage boundaries: the encoder layers [0, D) in W near-equal parts; the last stage also runs layer D's site
++    and compressor (``TF_DSV41_PREFILL_PIPE_BOUNDS``: explicit "0,5,10,15,21")."""
++
++    raw = os.environ.get("TF_DSV41_PREFILL_PIPE_BOUNDS", "").strip()
++    d = RP.decoder_start(cfg)
++    if raw:
++        b = [int(v) for v in raw.split(",")]
++    else:
++        b = [round(d * s / world) for s in range(world)] + [d + 1]
++    if len(b) != world + 1 or b[0] != 0 or b[-1] != d + 1 or any(b[i] >= b[i + 1] for i in range(world)):
++        raise ValueError(f"pipeline bounds {b}: {world} increasing stages from 0 to {d + 1}")
++    return b
++
++
++class Stage:
++    """This rank's encoder layers [lo, hi) at full width (one rank's ``Forward`` over them, no stores of its own:
++    ``bind`` points its slot at the prompt's slot's stores)."""
++
++    def __init__(self, fw, model_dir, lo: int, hi: int) -> None:
++        from . import weights as W
++        from .forward import Forward
++
++        cfg, dev = fw.cfg, fw.device
++        self.cfg, self.lo, self.hi = cfg, lo, hi
++        self.last = hi > RP.decoder_start(cfg)
++        ld = W.Loader(cfg, W.Shards(model_dir), 0, 1, dev)
++        layers = [ld.layer(L) for L in range(lo, min(hi, cfg.num_hidden_layers))]
++        if lo == 0:
++            embed = ld._dev(ld.src.rows("embed.weight", 0, cfg.vocab_size).to(torch.bfloat16))
++        else:
++            embed = torch.zeros((128, cfg.hidden_size), dtype=torch.bfloat16, device=dev)
++        tree = W.RankW(0, 1, 0, embed, layers, ld.native("norm.weight"), ld.x3("head", "col"), None, {})
++        if dev.type == "cuda":
++            from .csa2.backend import Triton
++
++            rows = max(fw.chunk, int(os.environ.get("TF_DSV41_PREFILL_ATTN_ROWS", "") or fw.chunk))
++            cs = Triton(rows, cfg.num_attention_heads, dev)
++        else:
++            from .csa2.twin import Twin
++
++            cs = Twin(cfg.qk_rope_head_dim, cfg.sliding_window)
++        self.fw = Forward(cfg, tree, csa2=cs, device=dev, limit=fw.limit, chunk=fw.chunk, pchunk=fw.pchunk,
++                          engram_rows={L: None for L in cfg.engram_layer_ids}, hasher=fw.hasher, slots=1,
++                          contiguous=False)
++        if self.fw.ring != fw.ring:
++            raise ValueError(f"pipeline stage ring {self.fw.ring} != the forward's {fw.ring}")
++        self.layers = [b.index for b in self.fw.blocks]
++        self.sources = [b.index for b in self.fw.blocks if b.mode == "full"]       # the kv sources it writes
++
++    def bind(self, slot, start: int) -> None:
++        """The stage's slot: the prompt's slot's stores for its layers (and the kv sources they read)."""
++
++        ss = self.fw.slots[0]
++        ss.swa = {L: slot.swa[L] for L in self.layers}
++        ss.comp, ss.ikeys, ss.carry = {}, {}, {}
++        for blk in self.fw.blocks:
++            if blk.ratio > 0:
++                src = blk.kv_source
++                ss.comp[src], ss.ikeys[src] = slot.comp[src], slot.ikeys[src]
++            if blk.index in slot.carry:
++                ss.carry[blk.index] = slot.carry[blk.index]
++        ss.pos, ss.tail, ss.taps, ss.pending = start, [], {}, None
++
++    def run(self, start: int, ids, x_in, sel_in, rows: dict, pend_in):
++        """One segment through this stage's layers; returns (streams, ctx). A stage before the last leaves its last
++        FFN post pending (``st.gathered``, ``st.coefs[st.cur]``); the last stops at the decoder's first site."""
++
++        from . import prefill_mm as PM
++        from . import prune as PR
++        from .forward import Pending, Streams
++
++        fw, cfg = self.fw, self.cfg
++        dev, D, ops, n = fw.device, cfg.hidden_size, fw.hc, len(ids)
++        ss = fw.slots[0]
++        if ss.pos != start:
++            raise RuntimeError(f"pipeline stage [{self.lo}, {self.hi}): a segment at {start}, the stage is at {ss.pos}")
++        if x_in is None:
++            x = fw.embed_rows(torch.tensor(list(ids), dtype=torch.long, device=dev)).repeat(1, cfg.hc_mult)
++            x = x.contiguous()
++        else:
++            x = x_in
++        first = ops.Coefs(n, dev) if pend_in is None else ops.Coefs(n, dev, pre=pend_in[1], post=pend_in[2],
++                                                                     comb=pend_in[3])
++        st = Streams(x, torch.empty((n, D), dtype=N.ACT, device=dev), ops.Scratch(n, dev, D),
++                     [first, ops.Coefs(n, dev)], 0, None if pend_in is None else pend_in[0])
++        wants = getattr(ops, "out_of_place", None)
++        if wants is not None and wants(n):
++            st.alt = torch.empty_like(x)
++        ctx = B.Context(fw.win_of(0, start, n), fw.tables, fw.csa2, fw.ring, ss, 0, fw.staging(n))
++        if sel_in is not None:
++            ctx.sel = sel_in
++        with PM.fast(fw.fast_prefill), PR.phase(True):
++            fw._layers(st, [ctx], rows, upto=RP.decoder_start(cfg) if self.last else None)
++        ss.pending = Pending(start, list(ids), ctx.proj, {})
++        fw.keep(0, n - 1)
++        return st, ctx
++
++
++class Pipeline:
++    """One prompt at a time through the stages (``SlotsForward.prefill`` routes a replay-mode segment here when
++    ``takes`` it). Every rank calls ``step`` / ``drain`` / ``abandon`` with the same arguments in the same order."""
++
++    def __init__(self, fw, model_dir, min_rows: int) -> None:
++        cfg = fw.cfg
++        self.fw, self.cfg, self.min_rows = fw, cfg, int(min_rows)
++        self.W, self.r = fw.world, fw.rank
++        self.bounds = bounds_for(cfg, self.W)
++        self.d = RP.decoder_start(cfg)
++        self.owner = {L: next(s for s in range(self.W) if self.bounds[s] <= L < self.bounds[s + 1])
++                      for L in range(self.bounds[-1])}
++        self.stage = Stage(fw, model_dir, self.bounds[self.r], self.bounds[self.r + 1])
++        self.srcs = sorted(L for L in cfg.kv_source_layer_ids if L < self.bounds[-1])
++        self.lookback = max(1, cfg.engram_max_ngram_size - 1)
++        self.slot = None
++        self.rounds = self.segments = 0
++        base = getattr(fw.comm, "base", fw.comm)     # the RoCE transport wraps NCCL (``base``)
++        on = (os.environ.get("TF_DSV41_PIPE_P2P", "1").strip() or "1") != "0"
++        self.p2p = getattr(base, "p2p", None) if on else None     # a stage's output straight to the next rank
++        self.trace = (os.environ.get("TF_DSV41_PIPE_TRACE", "0").strip() or "0") != "0"
++        self.prof = {"engram": 0.0, "stage": 0.0, "exchange": 0.0, "rounds": 0}
++        self.laid = None                # (ACT, ACC) the exchange is laid out for (``_layout`` on first use)
++        self._clear()
++
++    # -- the exchange's layout (every rank the same) -----------------------------------------------------------------
++    def _layout(self) -> None:
++        cfg, C, fw = self.cfg, self.fw.pchunk, self.fw
++        D, D4 = cfg.hidden_size, cfg.hidden_size * cfg.hc_mult
++        a_, c_ = (torch.empty((), dtype=t).element_size() for t in (N.ACT, N.ACC))       # activations, fp32 values
++        probe = _row_bytes(fw.csa2.rows(1, cfg.head_dim, fw.device)) + \
++            _row_bytes(fw.csa2.keys(1, cfg.index_head_dim, fw.device))           # a compressed row + its index key
++        self.rowb = {L: probe for L in self.srcs}
++        self.cap = {L: C // max(1, cfg.compress_ratio(L)) + 2 for L in self.srcs}
++        K = RP.KEEP
++        fwd = [("flags", 4), ("x", C * D4 * a_), ("sel", C * cfg.index_topk * 4), ("cnt", C * 4),
++               ("g", C * D * c_), ("pre", C * 4 * c_), ("post", C * 4 * c_), ("comb", C * 16 * c_)]
++        bc = [("sx", K * D4 * a_), ("so", K * D * a_), ("spre", K * 4 * c_), ("spost", K * 4 * c_),
++              ("scomb", K * 16 * c_)] + [(f"src{L}", self.cap[L] * self.rowb[L]) for L in self.srcs]
++        self.off = {}
++        size = {}
++        for region, parts in (("f", fwd), ("b", bc)):
++            a = 0
++            for name, n in parts:       # 16-byte aligned parts (fp64 views in exact numerics)
++                self.off[name] = (region, a, n)
++                a += -(-n // 16) * 16
++            size[region] = a
++        self.nf, self.nb = size["f"], size["b"]
++        dev = self.fw.device
++        self.buf = {"f": torch.zeros((self.nf,), dtype=torch.uint8, device=dev),
++                    "b": torch.zeros((self.nb,), dtype=torch.uint8, device=dev)}
++        self.recv_f = torch.empty(((1 if self.p2p is not None else self.W) * self.nf,), dtype=torch.uint8, device=dev)
++        self.recv_b = torch.empty((self.W * self.nb,), dtype=torch.uint8, device=dev)
++        self.laid = (N.ACT, N.ACC)
++
++    def _put(self, name: str, t: torch.Tensor) -> None:
++        region, a, n = self.off[name]
++        b = t.contiguous().view(-1).view(torch.uint8)
++        if b.numel() > n:
++            raise RuntimeError(f"pipeline exchange: {name} holds {n} bytes, not {b.numel()}")
++        self.buf[region][a:a + b.numel()].copy_(b)
++
++    def _get(self, got: torch.Tensor, name: str, dtype, shape) -> torch.Tensor:
++        _, a, _ = self.off[name]
++        n = int(torch.Size(shape).numel()) * torch.empty((), dtype=dtype).element_size()
++        return got[a:a + n].view(dtype).view(shape).clone()
++
++    def _clear(self) -> None:
++        self.slot = None
++        self.entered: list = []         # every round's new segment (start, ids) or None (drain), since the start
++        self.inp = None                 # (x, sel, pend) of this stage's next segment (stages after the first)
++        self.hist: list = []            # the prompt's ids from ``base`` on (Engram's lookback)
++        self.base = 0
++
++    # -- the protocol ------------------------------------------------------------------------------------------------
++    def takes(self, slot: int, n: int, ids=None) -> bool:
++        """Whether this segment goes through the line: the slot's line is running, or a long enough segment. A
++        segment with image positions (``vision.py``: ids from ``VBASE``) never does: the stages run text layers only
++        (no image rows, no ``bias_vl`` routing); the caller drains the slot's line before the tensor-parallel pass."""
++
++        if ids is not None and len(ids) and max(ids) >= _vbase():
++            return False
++        return self.slot == slot or (self.min_rows > 0 and n >= self.min_rows)
++
++    def step(self, slot: int, start: int, ids) -> None:
++        """A new segment of ``slot``'s prompt enters the line (a pipeline for another slot drains first)."""
++
++        fw = self.fw
++        s = fw.slots[slot]
++        if self.slot is not None and self.slot != slot:
++            self.drain()
++        if self.slot is None:
++            if s.pos != start:
++                raise RuntimeError(f"slot {slot}: a pipelined segment at {start}, the slot is at {s.pos}")
++            self.slot = slot
++            self.stage.bind(s, start)
++            tail = list(s.tail)[-self.lookback:]
++            self.hist, self.base = tail + [], start - len(tail)
++        elif start != self.base + len(self.hist):
++            raise RuntimeError(f"slot {slot}: a pipelined segment at {start}, the line is at "
++                               f"{self.base + len(self.hist)}")
++        ids = tuple(int(t) for t in ids)
++        self.hist.extend(ids)
++        s.pos, s.pending, s.taps = start + len(ids), None, {}       # what ``keep`` leaves (the carry: ``drain``)
++        s.tail = (list(s.tail) + list(ids))[-self.lookback:]
++        self.segments += 1
++        self._round((start, ids))
++
++    def drain(self) -> None:
++        """Run the line empty, then every stage's SWA rows and carries to every rank: the slot's state is whole."""
++
++        if self.slot is None:
++            return
++        while any(e is not None for e in self.entered[-(self.W - 1):]):
++            self._round(None)
++        self._finals()
++        self._clear()
++        if self.trace:
++            print(f"[dsv41] {self.report()}", flush=True)
++            self.prof = {k: 0 * v for k, v in self.prof.items()}
++
++    def abandon(self, slot: int | None = None) -> None:
++        """The slot was reset or restored: the line's segments are dropped (every rank)."""
++
++        if self.slot is not None and (slot is None or slot == self.slot):
++            self._clear()
++
++    # -- a round -----------------------------------------------------------------------------------------------------
++    def _seg(self, t: int, s: int):
++        """The segment stage s runs in round t (or None)."""
++
++        i = t - s
++        return self.entered[i] if 0 <= i < len(self.entered) else None
++
++    def _engram(self, seg, L: int) -> torch.Tensor:
++        """Layer L's Engram rows of ``seg`` at full width: each rank's hash heads, gathered (a collective)."""
++
++        fw = self.fw
++        start, ids = seg
++        i = start - self.base
++        look = self.hist[max(0, i - self.lookback):i]
++        hashes = fw.hasher(torch.tensor(ids), lookback=torch.tensor(look, dtype=torch.long))
++        blk = next(b for b in fw.blocks if b.index == L)
++        mine = B.engram_rows(blk, hashes, fw.engram_rows[L], fw.rank, fw.world, fw.hasher.layout)
++        return fw.gather_cols(mine.to(fw.device))
++
++    def _rows_of(self, L: int, start: int, n: int) -> torch.Tensor:
++        """The compressed rows of kv source L a segment [start, start + n) can write (and the one before)."""
++
++        r = max(1, self.cfg.compress_ratio(L))
++        return torch.arange(max(0, start // r - 1), (start + n) // r, device=self.fw.device)
++
++    def _round(self, new) -> None:
++        fw, cfg, W, r = self.fw, self.cfg, self.W, self.r
++        if self.laid != (N.ACT, N.ACC):
++            self._layout()
++        self.entered.append(new)
++        t = len(self.entered) - 1
++        tick = self._tick()
++        rows = {}
++        for L in cfg.engram_layer_ids:
++            if L < self.bounds[-1]:
++                seg = self._seg(t, self.owner[L])
++                if seg is not None:
++                    full = self._engram(seg, L)
++                    if self.owner[L] == r:
++                        rows[L] = full
++        self._tock(tick, "engram")
++        tick = self._tick()
++        mine = self._seg(t, r)
++        if mine is not None:
++            start, ids = mine
++            n = len(ids)
++            x_in, sel_in, pend_in = self.inp if (r > 0 and self.inp is not None) else (None, None, None)
++            st, ctx = self.stage.run(start, ids, x_in, sel_in, rows, pend_in)
++            self._put("x", st.x.to(N.ACT))
++            self._put("flags", torch.tensor([int(ctx.sel is not None)], dtype=torch.int32, device=fw.device))
++            if ctx.sel is not None:
++                self._put("sel", ctx.sel[0].to(torch.int32))
++                self._put("cnt", ctx.sel[1].to(torch.int32))
++            acc = N.ACC
++            if not self.stage.last:
++                cf = st.coefs[st.cur]
++                self._put("g", st.gathered.to(acc))
++                self._put("pre", cf.pre.to(acc))
++                self._put("post", cf.post.to(acc))
++                self._put("comb", cf.comb.to(acc))
++            else:                       # the CED stash rows: the segment's last KEEP rows (all of a shorter one)
++                m = min(n, RP.KEEP)
++                cf = st.coefs[st.cur]
++                self._put("sx", st.x[n - m:].to(N.ACT))
++                self._put("so", st.out[n - m:].to(N.ACT))
++                self._put("spre", cf.pre[n - m:].to(acc))
++                self._put("spost", cf.post[n - m:].to(acc))
++                self._put("scomb", cf.comb[n - m:].to(acc))
++            slot = fw.slots[self.slot]
++            for L in self.stage.sources:
++                if L in self.srcs:
++                    self._put(f"src{L}", self._pack(slot, L, start, n))
++        self._tock(tick, "stage")
++        tick = self._tick()
++        prev = self._seg(t, r - 1) if r > 0 else None
++        if self.p2p is not None:        # the output to rank r + 1, rank r - 1's to this rank (one NCCL group)
++            sends = [(self.buf["f"], r + 1)] if (mine is not None and r < W - 1) else []
++            recvs = [(self.recv_f, r - 1)] if prev is not None else []
++            if sends or recvs:
++                self.p2p(sends, recvs)
++            fwd = self.recv_f
++        else:
++            fast_gather(fw.comm, self.buf["f"], self.recv_f)
++            fwd = self.recv_f.view(W, self.nf)[r - 1] if r > 0 else None
++        fast_gather(fw.comm, self.buf["b"], self.recv_b)
++        got = self.recv_b.view(W, self.nb)
++        self.rounds += 1
++        slot = fw.slots[self.slot]
++        for L in self.srcs:             # the kv sources' rows every other rank wrote this round
++            q = self.owner[L]
++            seg = self._seg(t, q)
++            if q != r and seg is not None:
++                self._unpack(slot, L, seg[0], len(seg[1]), got[q])
++        last = self._seg(t, W - 1)
++        if last is not None:
++            self._stash(last, got[W - 1])
++        if r > 0:                       # this stage's next segment: what rank r - 1 ran this round
++            self.inp = self._input(fwd, len(prev[1])) if prev is not None else None
++        self._tock(tick, "exchange")
++        self.prof["rounds"] += 1
++
++    def _tick(self):
++        if not self.trace:
++            return None
++        if self.fw.device.type == "cuda":
++            torch.cuda.synchronize()
++        import time
++
++        return time.perf_counter()
++
++    def _tock(self, tick, name: str) -> None:
++        if tick is None:
++            return
++        import time
++
++        if self.fw.device.type == "cuda":
++            torch.cuda.synchronize()
++        self.prof[name] += time.perf_counter() - tick
++
++    def report(self) -> str:
++        p = self.prof
++        n = max(1, p["rounds"])
++        return (f"pipeline rank {self.r}: {p['rounds']} rounds, a round: engram {1e3 * p['engram'] / n:.1f} ms, "
++                f"stage {1e3 * p['stage'] / n:.1f} ms, exchange {1e3 * p['exchange'] / n:.1f} ms")
++
++    def _input(self, g: torch.Tensor, n: int):
++        cfg = self.cfg
++        D, D4 = cfg.hidden_size, cfg.hidden_size * cfg.hc_mult
++        x = self._get(g, "x", N.ACT, (n, D4))
++        sel = None
++        if int(self._get(g, "flags", torch.int32, (1,)).item()):
++            sel = (self._get(g, "sel", torch.int32, (n, cfg.index_topk)), self._get(g, "cnt", torch.int32, (n,)))
++        acc = N.ACC
++        pend = (self._get(g, "g", acc, (1, n, D)), self._get(g, "pre", acc, (n, 4)), self._get(g, "post", acc, (n, 4)),
++                self._get(g, "comb", acc, (n, 16)))
++        return x, sel, pend
++
++    def _stash(self, seg, g: torch.Tensor) -> None:
++        """Every rank's CED stash after the last stage's segment (``replay.encode``'s extend and cut)."""
++
++        cfg, fw = self.cfg, self.fw
++        start, ids = seg
++        n = len(ids)
++        m = min(n, RP.KEEP)
++        D, D4 = cfg.hidden_size, cfg.hidden_size * cfg.hc_mult
++        acc = N.ACC
++        got = RP.Stash(start + n - m, self._get(g, "sx", N.ACT, (m, D4)), self._get(g, "so", N.ACT, (m, D)),
++                       self._get(g, "spre", acc, (m, 4)), self._get(g, "spost", acc, (m, 4)),
++                       self._get(g, "scomb", acc, (m, 16)), list(ids[n - m:]))
++        if m == n:
++            have = fw.stash.get(self.slot)
++            if have is None or have.hi != start:
++                have = RP.empty(fw, start)
++            fw.stash[self.slot] = have.extend(got)
++        else:
++            fw.stash[self.slot] = got
++
++    def _tensors(self, slot, L: int, rows: torch.Tensor):
++        """(row tensor, physical rows) of kv source L's compressed rows and index keys."""
++
++        out = []
++        for store in (slot.comp[L], slot.ikeys[L]):
++            for t in _ring_tensors(store):
++                out.append((t, store.phys(rows).to(t.device)))
++        return out
++
++    def _pack(self, slot, L: int, start: int, n: int) -> torch.Tensor:
++        rows = self._rows_of(L, start, n)
++        return torch.cat([t[p].contiguous().reshape(-1).view(torch.uint8) for t, p in self._tensors(slot, L, rows)])
++
++    def _unpack(self, slot, L: int, start: int, n: int, g: torch.Tensor) -> None:
++        rows = self._rows_of(L, start, n)
++        _, a, _ = self.off[f"src{L}"]
++        k = len(rows)
++        for t, p in self._tensors(slot, L, rows):
++            nb = k * t[0].numel() * t.element_size()
++            t[p] = g[a:a + nb].view(t.dtype).view((k,) + tuple(t.shape[1:]))
++            a += nb
++
++    # -- the drained line's state --------------------------------------------------------------------------------
++    def _finals(self) -> None:
++        """Each stage's layers' SWA rows of the prompt's last window and its kv sources' carries, to every rank."""
++
++        fw, W, r = self.fw, self.W, self.r
++        s = fw.slots[self.slot]
++        win = torch.arange(max(0, s.pos - self.cfg.sliding_window), s.pos, dtype=torch.long) % fw.ring
++        enc = [L for L in range(self.bounds[-1]) if L < self.d]
++        ring = {L: s.swa[L] for L in enc}
++        per = {}
++        for L in enc:
++            st = ring[L]
++            per[L] = sum(t[0].numel() * t.element_size() for t in _ring_tensors(st))
++        carries = sorted(L for L in s.carry if L < self.bounds[-1])
++        cb = {L: s.carry[L].numel() * s.carry[L].element_size() for L in carries}
++        mine = [L for L in enc if self.owner[L] == r]
++        size = max(sum(len(win) * per[L] for L in enc if self.owner[L] == q) +
++                   sum(cb[L] for L in carries if self.owner[L] == q) for q in range(W))
++        send = torch.zeros((max(16, -(-size // 16) * 16),), dtype=torch.uint8, device=fw.device)
++        a = 0
++        for L in mine:
++            for t in _ring_tensors(ring[L]):
++                b = t[win.to(t.device)].reshape(-1).view(torch.uint8)
++                send[a:a + b.numel()].copy_(b)
++                a += b.numel()
++        for L in carries:
++            if self.owner[L] == r:
++                b = s.carry[L].contiguous().reshape(-1).view(torch.uint8)
++                send[a:a + b.numel()].copy_(b)
++                a += b.numel()
++        recv = torch.empty((W * send.numel(),), dtype=torch.uint8, device=fw.device)
++        fast_gather(fw.comm, send, recv)
++        got = recv.view(W, -1)
++        for q in range(W):
++            if q == r:
++                continue
++            a = 0
++            for L in enc:
++                if self.owner[L] != q:
++                    continue
++                for t in _ring_tensors(ring[L]):
++                    w = t[0].numel() * t.element_size()
++                    nb = len(win) * w
++                    t[win.to(t.device)] = got[q, a:a + nb].view(t.dtype).view((len(win),) + tuple(t.shape[1:]))
++                    a += nb
++            for L in carries:
++                if self.owner[L] == q:
++                    c = s.carry[L]
++                    c.copy_(got[q, a:a + cb[L]].view(c.dtype).view(c.shape))
++                    a += cb[L]
++
++    def describe(self) -> str:
++        return (f"pipelined prompts from {self.min_rows} rows: stages {self.bounds} (this rank "
++                f"[{self.stage.lo}, {self.stage.hi}))")
++
++
++def _ring_tensors(store) -> list[torch.Tensor]:
++    """A ring store's row tensors (``Records``: values and scales; ``Floats``: data)."""
++
++    if hasattr(store, "values"):
++        return [store.values, store.scales]
++    return [store.data]
++
++
++def _row_bytes(store) -> int:
++    return sum(t[0].numel() * t.element_size() for t in _ring_tensors(store))
++
++
++__all__ = ["Pipeline", "Stage", "bounds_for", "rows_min"]
 diff --git a/src/tensorfold/families/deepseek_v41/cuda/planlink.py b/src/tensorfold/families/deepseek_v41/cuda/planlink.py
-index e8fb0d5..5f41827 100644
+index 33eb2fe07d8bcb6160716960cfffd0470bfc1edd..92679ddb36ae265ef8369f4e7e9850a83429e269 100644
 --- a/src/tensorfold/families/deepseek_v41/cuda/planlink.py
 +++ b/src/tensorfold/families/deepseek_v41/cuda/planlink.py
-@@ -57,20 +57,23 @@ def keepalive(conn: socket.socket, idle: int = 30, interval: int = 10, count: in
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: MIT
+ # Copyright (c) 2026 Jay Leaton. The DeepSeek-V4.1-Flash family of TensorFold (Apache-2.0): see THIRD_PARTY_NOTICES.md.
+-"""The round plan from rank 0 to rank 1 over a TCP socket instead of the communicator (``TF_DSV41_PLAN_LINK=tcp``).
++"""The round plan from rank 0 to the followers over a TCP socket instead of the communicator (``TF_DSV41_PLAN_LINK=tcp``).
+ 
+ Why: ``engine._Link`` shares each plan with two all-gathers on the GPU stream (its length, then its ints), each
+ followed by a ``.tolist()``: ~0.74 ms of rank 0's host a round (G7 C1), and because the gathers queue behind
+@@ -14,6 +14,11 @@ while both GPUs still run. The plan is the same list of ints as before (``plan.P
+ order and rank 1's decisions are unchanged; a closed connection raises on both sides (rank 1 stops instead of
+ hanging in a collective).
+ 
++Who is who: a follower opens with a hello (``HELLO``: magic, its rank, the world size) and waits for rank 0's
++one-byte answer; rank 0 accepts until it holds ranks 1 .. world - 1 exactly once each, in rank order, and closes
++anything else (a stray client, a duplicate rank, another world size) without counting it. A refused follower
++raises at boot instead of following the wrong leader; rank 0 never pairs a plan stream with an unknown peer.
++
+ Knobs: TF_DSV41_PLAN_LINK (nccl: the communicator, default; tcp; rdma), TF_DSV41_PLAN_PORT, TF_DSV41_PLAN_TIMEOUT
+ (connect / accept seconds, 300).
+ 
+@@ -41,6 +46,9 @@ from array import array
+ 
+ ENV = "TF_DSV41_PLAN_LINK"
+ _LEN = struct.Struct("<I")
++HELLO = struct.Struct("<4sHH")     # b"TFPL", rank, world
++MAGIC = b"TFPL"
++OK, REFUSED = b"\x01", b"\x00"
+ 
+ 
+ def mode() -> str:
+@@ -70,40 +78,99 @@ def keepalive(conn: socket.socket, idle: int = 30, interval: int = 10, count: in
  
  
  class TcpLink:
@@ -443,30 +1880,94 @@ index e8fb0d5..5f41827 100644
              srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
              srv.bind(("", int(port)))
 -            srv.listen(1)
+-            srv.settimeout(timeout_s)
 +            srv.listen(max(1, self.world - 1))
-             srv.settimeout(timeout_s)
              try:
 -                conn, _ = srv.accept()
-+                for _ in range(self.world - 1):
-+                    conns.append(srv.accept()[0])
++                conns = self._accept(srv, time.monotonic() + timeout_s)
              finally:
                  srv.close()
          else:
-@@ -83,14 +86,19 @@ class TcpLink:
-                     if time.monotonic() > end:
-                         raise
-                     time.sleep(0.05)
--        conn.settimeout(None)                   # rank 1 may idle in recv for hours: no read deadline ...
--        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
--        keepalive(conn)                         # ... but a dead peer or link ends it (G12 bug 2)
--        self.conn = conn
-+            conns.append(conn)
+-            end = time.monotonic() + timeout_s
+-            while True:
++            conns.append(self._join(host, int(port), time.monotonic() + timeout_s))
 +        for conn in conns:
 +            conn.settimeout(None)               # a follower may idle in recv for hours: no read deadline ...
 +            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 +            keepalive(conn)                     # ... but a dead peer or link ends it (G12 bug 2)
 +        self.conns = conns
 +        self.conn = conns[0] if conns else None
++
++    def _accept(self, srv: socket.socket, end: float) -> list[socket.socket]:
++        """Rank 0: one connection a follower rank, identified by its hello, in rank order."""
++
++        got: dict[int, socket.socket] = {}
++        while len(got) < self.world - 1:
++            left = end - time.monotonic()
++            if left <= 0:
++                for c in got.values():
++                    c.close()
++                missing = sorted(set(range(1, self.world)) - set(got))
++                raise TimeoutError(f"plan link: rank(s) {missing} did not connect (TF_DSV41_PLAN_TIMEOUT)")
++            srv.settimeout(left)
++            try:
++                conn, addr = srv.accept()
++            except socket.timeout:
++                continue
++            why = None
++            try:
++                conn.settimeout(10.0)
++                magic, rank, world = HELLO.unpack(_read(conn, HELLO.size))
++                if magic != MAGIC:
++                    why = "not a plan link hello"
++                elif world != self.world:
++                    why = f"world {world}, this is world {self.world}"
++                elif not 0 < rank < self.world:
++                    why = f"rank {rank} outside 1 .. {self.world - 1}"
++                elif rank in got:
++                    why = f"rank {rank} is already connected"
++            except (OSError, ConnectionError, struct.error) as e:
++                why = f"no hello ({e})"
++            if why is not None:
++                print(f"[tensorfold] plan link: refused {addr[0]}: {why}", flush=True)
+                 try:
+-                    conn = socket.create_connection((host, int(port)), timeout=5.0)
+-                    break
++                    conn.sendall(REFUSED)
+                 except OSError:
+-                    if time.monotonic() > end:
+-                        raise
+-                    time.sleep(0.05)
+-        conn.settimeout(None)                   # rank 1 may idle in recv for hours: no read deadline ...
+-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+-        keepalive(conn)                         # ... but a dead peer or link ends it (G12 bug 2)
+-        self.conn = conn
++                    pass
++                conn.close()
++                continue
++            conn.sendall(OK)
++            got[rank] = conn
++        return [got[r] for r in range(1, self.world)]
++
++    def _join(self, host: str, port: int, end: float) -> socket.socket:
++        """A follower: connect, say who it is, and wait for rank 0's yes."""
++
++        while True:
++            try:
++                conn = socket.create_connection((host, port), timeout=5.0)
++                break
++            except OSError:
++                if time.monotonic() > end:
++                    raise
++                time.sleep(0.05)
++        conn.settimeout(max(10.0, end - time.monotonic()))
++        conn.sendall(HELLO.pack(MAGIC, self.rank, self.world))
++        answer = _read(conn, 1)
++        if answer != OK:
++            conn.close()
++            raise ConnectionError(f"plan link: rank 0 at {host}:{port} refused rank {self.rank} of {self.world} "
++                                  "(a duplicate rank or a different world size; see rank 0's log)")
++        return conn
  
      def send(self, plan) -> None:
          body = array("q", plan).tobytes()
@@ -477,7 +1978,7 @@ index e8fb0d5..5f41827 100644
          self.sent += 1
  
      def _exact(self, n: int) -> bytes:
-@@ -111,18 +119,19 @@ class TcpLink:
+@@ -124,10 +191,21 @@ class TcpLink:
          return out.tolist()
  
      def close(self) -> None:
@@ -490,21 +1991,483 @@ index e8fb0d5..5f41827 100644
 +                conn.close()
 +            except OSError:
 +                pass
++
++
++def _read(conn: socket.socket, n: int) -> bytes:
++    buf = bytearray()
++    while len(buf) < n:
++        k = conn.recv(n - len(buf))
++        if not k:
++            raise ConnectionError("plan link: the peer closed the connection during the handshake")
++        buf += k
++    return bytes(buf)
+ 
+ 
+ RDMA_MAGIC = 0x47314452                  # "RD1G": the rdma link's TCP handshake
+@@ -243,18 +321,20 @@ def _runtime(engine_link):
+     return rt if rt is not None and getattr(rt, "proxy", None) is not None else None
  
  
 -def make(engine_link, rank: int, master: str, master_port: int):
 +def make(engine_link, rank: int, master: str, master_port: int, world: int = 2):
-     """The batcher's link: ``engine_link`` (the communicator's) unless TF_DSV41_PLAN_LINK=tcp."""
+     """The batcher's link: ``engine_link`` (the communicator's) unless TF_DSV41_PLAN_LINK=tcp / rdma (G14); wrapped by
+-    ``Pinned`` under TF_DSV41_PLAN_PIN."""
++    ``Pinned`` under TF_DSV41_PLAN_PIN. ``rdma`` at any world size: the mailbox (``roce_msg.h``) is one sender and
++    every other rank a receiver (the proxy posts each chunk to every peer; a slot is reused once every receiver acked
++    it); the TCP links to the followers carry the handshake and their liveness."""
  
-     if mode() != "tcp":
-         return engine_link
--    return TcpLink(rank, master, port_for(master_port))
-+    return TcpLink(rank, master, port_for(master_port), world=world)
+     m = mode()
+     if m == "nccl":
+         link = engine_link
+     elif m == "tcp":
+-        link = TcpLink(rank, master, port_for(master_port))
++        link = TcpLink(rank, master, port_for(master_port), world=world)
+     else:
+         rt = _runtime(engine_link)
+-        tcp = TcpLink(rank, master, port_for(master_port))
++        tcp = TcpLink(rank, master, port_for(master_port), world=world)
+         if rt is None:                          # NCCL on both ranks (the RoCE setup is collective): plain tcp
+             print(f"[dsv41] plan link: {ENV}=rdma without a RoCE runtime: tcp", flush=True)
+             link = tcp
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/ppbench.py b/src/tensorfold/families/deepseek_v41/cuda/ppbench.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e6311ebbcf86b69f9c47cd2b8e5973b44c871a06
+--- /dev/null
++++ b/src/tensorfold/families/deepseek_v41/cuda/ppbench.py
+@@ -0,0 +1,412 @@
++# SPDX-License-Identifier: MIT
++"""Pipeline ("assembly line") prefill prototype for DeepSeek-V4.1-Flash on four ranks: does prompt reading get faster
++when each rank runs a quarter of the encoder layers at full width instead of a quarter of every layer?
++
++Tensor parallelism splits every layer four ways: the indexer (32 heads), the compressor and the single KV head's
++projections, the mHC streams and the selection run in full on every rank, and every sublayer ends in an all-gather.
++Here rank s holds encoder layers [B[s], B[s + 1]) at full width (``Loader(.., 0, 1)``) and a prompt's chunks flow
++rank 0 -> 1 -> 2 -> 3: in round t, rank s runs chunk t - s. One all-gather a round carries each rank's output to the
++next (the chunk's streams after its last layer, the latest index source's selection) and the rows the round wrote
++into the kv sources' compressed stores (every later stage reads them; serving would also need them on every rank).
++
++Run as ``serve4.sh run tensorfold.families.deepseek_v41.cuda.ppbench --chunks 78`` (OUT/prompt.txt: the prompt's
++text, else random ids). Rank 0 writes /out/ppbench.json: seconds a round (steady state), the whole pipeline, each
++stage's compute, and the first ``--compare`` chunks' streams against the tensor-parallel forward (``upto`` 20).
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import sys
++import time
++from pathlib import Path
++
++import torch
++
++DEFAULT_BOUNDS = "0,5,10,15,21"
++
++
++def _gather_floats(comm, values: list[float]) -> list[list[float]]:
++    from tensorfold.cuda.comm import fast_gather
++
++    mine = torch.tensor(values, dtype=torch.float64, device="cuda")
++    got = torch.empty((comm.world * len(values),), dtype=torch.float64, device="cuda")
++    fast_gather(comm, mine, got)
++    return got.view(comm.world, -1).tolist()
++
++
++def prompt_ids(comm, model: Path, n: int, rank: int) -> list[int]:
++    """n token ids, the same on every rank: rank 0 tokenizes /out/prompt.txt (repeated to length), else random."""
++
++    from tensorfold.cuda.comm import fast_gather
++
++    buf = torch.zeros((n,), dtype=torch.int64, device="cuda")
++    if rank == 0:
++        p = Path("/out/prompt.txt")
++        if p.exists():
++            from tokenizers import Tokenizer
++
++            tok = Tokenizer.from_file(str(model / "tokenizer.json"))
++            ids = tok.encode(p.read_text()).ids
++            while len(ids) < n:
++                ids = ids + ids
++            buf.copy_(torch.tensor(ids[:n], dtype=torch.int64))
++        else:
++            g = torch.Generator().manual_seed(7)
++            buf.copy_(torch.randint(1000, 60000, (n,), generator=g))
++    got = torch.empty((comm.world * n,), dtype=torch.int64, device="cuda")
++    fast_gather(comm, buf, got)
++    return got[:n].tolist()
++
++
++class Stage:
++    """Rank s's layers [lo, hi) at full width (``hi`` 21: layer 20's attention site and compressor, as CED's encoder
++    pass ends), with one slot of contiguous stores (and the kv sources its layers read from earlier stages)."""
++
++    def __init__(self, eng, lo: int, hi: int) -> None:
++        from . import blocks as B
++        from . import weights as W
++        from .csa2.backend import Triton
++        from .forward import CHUNK, Forward, prefill_chunk
++
++        cfg, dev = eng.cfg, eng.device
++        self.cfg, self.lo, self.hi, self.last = cfg, lo, hi, hi > 20
++        ld = W.Loader(cfg, W.Shards(eng.model_dir), 0, 1, dev)
++        layers = [ld.layer(L) for L in range(lo, min(hi, cfg.num_hidden_layers))]
++        if lo == 0:
++            embed = ld._dev(ld.src.rows("embed.weight", 0, cfg.vocab_size).to(torch.bfloat16))
++        else:
++            embed = torch.zeros((128, cfg.hidden_size), dtype=torch.bfloat16, device=dev)
++        tree = W.RankW(0, 1, 0, embed, layers, ld.native("norm.weight"), ld.x3("head", "col"), None, {})
++        rows = int(os.environ.get("TF_DSV41_PREFILL_ATTN_ROWS", "") or CHUNK)
++        fw = eng.fw
++        self.fw = Forward(cfg, tree, csa2=Triton(max(CHUNK, rows), cfg.num_attention_heads, dev), device=dev,
++                          limit=eng.limit, chunk=CHUNK, pchunk=prefill_chunk(CHUNK),
++                          engram_rows={L: None for L in cfg.engram_layer_ids}, hasher=fw.hasher, slots=1)
++        s, cs = self.fw.slots[0], self.fw.csa2
++        for blk in self.fw.blocks:          # the kv sources an earlier stage computes: their rows arrive each round
++            src = blk.kv_source if blk.ratio > 0 else None
++            if src is not None and src not in s.comp:
++                n = eng.limit // blk.ratio + 1
++                s.comp[src] = cs.rows(n, cfg.head_dim, dev)
++                s.ikeys[src] = cs.keys(n, cfg.index_head_dim, dev)
++        self.sources = [b.index for b in self.fw.blocks if b.mode == "full"]       # the ones this stage writes
++        self.B = B
++
++    def run(self, k: int, C: int, ids: list[int], x_in, sel_in, eng_rows: dict, pend_in=None):
++        """Chunk k through this stage's layers. ``pend_in``: the previous stage's pending FFN post (gathered
++        partial [1, C, D] fp32, its coefficients pre / post / comb): the first block's mHC boundary applies it, as
++        the next block does in one process. Returns (streams, ctx): a stage before the last leaves its own last
++        FFN post pending (st.gathered, st.coefs[st.cur]); the last stops at layer 20's site."""
++
++        from . import numerics as N
++        from . import prefill_mm as PM
++        from . import prune as PR
++        from .forward import Pending, Streams
++
++        fw, cfg, B = self.fw, self.cfg, self.B
++        dev, D, ops = fw.device, cfg.hidden_size, fw.hc
++        start = k * C
++        if x_in is None:
++            ids_t = torch.tensor(ids[start:start + C], dtype=torch.long, device=dev)
++            x = fw.embed_rows(ids_t).repeat(1, cfg.hc_mult).contiguous()
++        else:
++            x = x_in
++        first = ops.Coefs(C, dev) if pend_in is None else ops.Coefs(C, dev, pre=pend_in[1], post=pend_in[2],
++                                                                     comb=pend_in[3])
++        st = Streams(x, torch.empty((C, D), dtype=N.ACT, device=dev), ops.Scratch(C, dev, D),
++                     [first, ops.Coefs(C, dev)], 0, None if pend_in is None else pend_in[0])
++        wants = getattr(ops, "out_of_place", None)
++        if wants is not None and wants(C):
++            st.alt = torch.empty_like(x)
++        ctx = B.Context(fw.win_of(0, start, C), fw.tables, fw.csa2, fw.ring, fw.slots[0], 0, fw.staging(C))
++        if sel_in is not None:
++            ctx.sel = sel_in
++        with PM.fast(fw.fast_prefill), PR.phase(True):
++            fw._layers(st, [ctx], eng_rows, upto=20 if self.last else None)
++        fw.slots[0].pending = Pending(start, list(ids[start:start + C]), ctx.proj, {})
++        fw.keep(0, C - 1)
++        return st, ctx
++
++    # -- the kv sources' rows a round wrote ---------------------------------------------------------------------------
++    def rows_of(self, L: int, start: int, C: int) -> torch.Tensor:
++        r = self.cfg.compress_ratio(L)
++        lo, hi = max(0, start // r - 1), (start + C) // r + 1
++        return torch.arange(lo, hi, device=self.fw.device)
++
++    def pack(self, L: int, start: int, C: int) -> torch.Tensor:
++        s = self.fw.slots[0]
++        rows = self.rows_of(L, start, C)
++        rec, keys = s.comp[L], s.ikeys[L]
++        p = rec.phys(rows).to(rec.values.device)
++        parts = [rec.values[p].reshape(-1).view(torch.uint8), rec.scales[p].reshape(-1).view(torch.uint8),
++                 keys.data[p].reshape(-1).view(torch.uint8)]
++        return torch.cat(parts)
++
++    def unpack(self, L: int, start: int, C: int, flat: torch.Tensor) -> None:
++        s = self.fw.slots[0]
++        if L not in s.comp:
++            return
++        rows = self.rows_of(L, start, C)
++        rec, keys = s.comp[L], s.ikeys[L]
++        p = rec.phys(rows).to(rec.values.device)
++        a = 0
++        for t in (rec.values, rec.scales, keys.data):
++            shape = (len(rows),) + tuple(t.shape[1:])
++            nb = len(rows) * t[0].numel() * t.element_size()
++            t[p] = flat[a:a + nb].view(t.dtype).view(shape)
++            a += nb
++
++    def payload_bytes(self, L: int, C: int) -> int:
++        s = self.fw.slots[0]
++        n = len(self.rows_of(L, 2 * C, C))
++        return n * sum(t[0].numel() * t.element_size() for t in (s.comp[L].values, s.comp[L].scales, s.ikeys[L].data))
++
++
++def engram_full(fw, ids: list[int], k: int, C: int, L: int) -> torch.Tensor:
++    """Layer L's Engram rows of chunk k at full width: every rank reads its hash heads, gathered in rank order (the
++    tensor-parallel forward's ``_engram_inputs`` for one chunk; a collective: every rank calls it)."""
++
++    from . import blocks as B
++
++    start = k * C
++    look = ids[max(0, start - (fw.cfg.engram_max_ngram_size - 1)):start]
++    hashes = fw.hasher(torch.tensor(ids[start:start + C]), lookback=torch.tensor(look, dtype=torch.long))
++    blk = next(b for b in fw.blocks if b.index == L)
++    mine = B.engram_rows(blk, hashes, fw.engram_rows[L], fw.rank, fw.world, fw.hasher.layout)
++    return fw.gather_cols(mine.to(fw.device))
++
++
++def main(argv: list[str] | None = None) -> int:
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--model", required=True)
++    ap.add_argument("--rank", type=int, required=True)
++    ap.add_argument("--world", type=int, default=4)
++    ap.add_argument("--master", required=True)
++    ap.add_argument("--port", type=int, default=29561)
++    ap.add_argument("--chunks", type=int, default=78)
++    ap.add_argument("--rows", type=int, default=2048)
++    ap.add_argument("--compare", type=int, default=2)
++    ap.add_argument("--bounds", default=DEFAULT_BOUNDS)
++    ap.add_argument("--context", type=int, default=0)
++    ap.add_argument("--debug", action="store_true", help="chunk 0: every layer's streams against the TP forward's")
++    a = ap.parse_args(argv)
++    from tensorfold.cuda.comm import fast_gather
++
++    from .engine import Dsv41Engine
++    from .forward import Seg
++
++    P, C, r = a.chunks, a.rows, a.rank
++    ctx_len = a.context or (P * C + 4096)
++    t0 = time.time()
++    eng = Dsv41Engine(Path(a.model), rank=r, master=a.master, port=a.port, context=ctx_len, parallel=1,
++                      serving=False, world=a.world)
++    boot = time.time() - t0
++    cfg, comm, fw, W = eng.cfg, eng.comm, eng.fw, a.world
++    bounds = [int(v) for v in a.bounds.split(",")]
++    if len(bounds) != W + 1:
++        raise SystemExit(f"--bounds: {W + 1} layer boundaries")
++    owner = {L: next(s for s in range(W) if bounds[s] <= L < bounds[s + 1]) for L in range(bounds[-1])}
++    ids = prompt_ids(comm, Path(a.model), P * C, r)
++    log = (lambda *m: print(f"[ppbench r{r}]", *m, flush=True))                          # noqa: E731
++
++    # -- the tensor-parallel forward's first chunks (the reference streams, and its time a chunk) -----------------
++    ref, tp_s = [], []
++    tp_trace = {}
++    caught = {}                         # (tag, layer) -> chunk 0's selection (debug)
++    if a.debug:
++        from . import blocks as BK
++
++        _orig_select = BK._select
++
++        def _spy(blk, ctx, qi, w):
++            _orig_select(blk, ctx, qi, w)
++            if ctx.win.p0 == 0 and ctx.sel is not None:
++                caught[(_spy.tag, blk.index)] = ctx.sel[0].clone()
++
++        _spy.tag = "tp"
++        BK._select = _spy
++        fw.overlap = 0                  # one segment a chunk: whole selections
++    for k in range(a.compare):
++        torch.cuda.synchronize()
++        t1 = time.perf_counter()
++        if a.debug and k == 0:
++            fw.trace = {}
++        st = fw.run([Seg(0, k * C, tuple(ids[k * C:(k + 1) * C]))], logits=False, prefill=True, upto=20)
++        fw.keep(0, C - 1)
++        torch.cuda.synchronize()
++        tp_s.append(time.perf_counter() - t1)
++        ref.append((st.x.float().clone(), st.out.float().clone()))
++        if fw.trace is not None:
++            tp_trace = {L: v.float().clone() for L, v in fw.trace.items()}
++            fw.trace = None
++    log(f"TP chunks: {[round(v, 3) for v in tp_s]} s")
++
++    t1 = time.time()
++    stage = Stage(eng, bounds[r], bounds[r + 1])
++    load_s = time.time() - t1
++    torch.cuda.empty_cache()
++    log(f"stage layers [{bounds[r]}, {bounds[r + 1]}) loaded in {load_s:.1f} s; "
++        f"{torch.cuda.memory_allocated() / 2 ** 30:.1f} GiB allocated")
++
++    # the round's exchange: [streams | selection | counts | the kv sources' rows], the same size on every rank
++    D4 = cfg.hidden_size * cfg.hc_mult
++    srcs = sorted(L for L in cfg.kv_source_layer_ids if L < bounds[-1])
++    probe = {L: Stage.payload_bytes(stage, L, C) if L in stage.fw.slots[0].comp else 0 for L in srcs}
++    sizes = _gather_floats(comm, [float(probe[L]) for L in srcs])
++    pay = {L: int(max(row[i] for row in sizes)) for i, L in enumerate(srcs)}
++    D = cfg.hidden_size
++    nx, ns, nc = C * D4 * 2, C * cfg.index_topk * 4, C * 4
++    ng, npre, npost, ncomb = C * D * 4, C * 4 * 4, C * 4 * 4, C * 16 * 4          # the pending FFN post
++    npend = ng + npre + npost + ncomb
++    nb = nx + ns + nc + npend + sum(pay.values())
++    send = torch.zeros((nb,), dtype=torch.uint8, device="cuda")
++    recv = torch.empty((W * nb,), dtype=torch.uint8, device="cuda")
++    x_in = sel_in = pend_in = None
++    rounds, comp_s, outs = [], [], {}
++    dbg, dbg_sel, dbg_layers = [], [], []
++    torch.cuda.synchronize()
++    tp0 = time.perf_counter()
++    for t in range(P + W - 1):
++        ta = time.perf_counter()
++        k = t - r
++        er = {}
++        for L in cfg.engram_layer_ids:
++            if L < bounds[-1]:
++                kL = t - owner[L]
++                if 0 <= kL < P:
++                    full = engram_full(fw, ids, kL, C, L)
++                    if owner[L] == r:
++                        er[L] = full
++        send.zero_()
++        if 0 <= k < P:
++            tb = time.perf_counter()
++            if a.debug and k == 0:
++                stage.fw.trace = {}
++                if r > 0 and x_in is not None and bounds[r] - 1 in tp_trace:
++                    want = tp_trace[bounds[r] - 1].reshape(C, -1)
++                    y = x_in.clone()
++                    stage.fw.hc.post_only(x_in, y, pend_in[0], stage.fw.hc.Coefs(C, "cuda", pre=pend_in[1],
++                                                                                  post=pend_in[2], comb=pend_in[3]))
++                    dbg.append(float((y.float() - want).norm() / want.norm()))
++            if a.debug:
++                _spy.tag = "pp"
++                if k == 0 and r > 0:            # what arrived against the TP forward's (this rank's own TP run)
++                    src = max(L for L in cfg.index_source_layer_ids if L < bounds[r])
++                    tp_sel = caught.get(("tp", src))
++                    if tp_sel is not None and sel_in is not None:
++                        dbg_sel.append(float((sel_in[0] == tp_sel).float().mean()))
++                    srcs_kv = max(L for L in cfg.kv_source_layer_ids if L < bounds[r])
++                if k == 0 and r > 0 and srcs_kv in stage.fw.slots[0].comp:
++                    a_rec = fw.slots[0].comp[srcs_kv]
++                    b_rec = stage.fw.slots[0].comp[srcs_kv]
++                    rr = torch.arange(0, C // cfg.compress_ratio(srcs_kv), device="cuda")
++                    va = a_rec.values[a_rec.phys(rr).to("cuda")]
++                    vb = b_rec.values[b_rec.phys(rr).to("cuda")]
++                    dbg_sel.append(float((va == vb).float().mean()))
++                    dbg_sel.append(float((va != 0).float().mean()))
++                    dbg_sel.append(float((vb != 0).float().mean()))
++            st, ctx = stage.run(k, C, ids, x_in if r > 0 else None, sel_in if r > 0 else None, er,
++                                pend_in if r > 0 else None)
++            if a.debug and k == 0:
++                for (tag, L), v in list(caught.items()):
++                    if tag == "pp" and ("tp", L) in caught:
++                        dbg_sel.append(float(L))
++                        dbg_sel.append(float((v == caught[("tp", L)]).float().mean()))
++            if stage.fw.trace is not None:
++                for L in sorted(stage.fw.trace):
++                    if L in tp_trace:
++                        g, w = stage.fw.trace[L].float(), tp_trace[L]
++                        dbg_layers.append((L, float((g - w).norm() / w.norm())))
++                stage.fw.trace = None
++            send[:nx].copy_(st.x.contiguous().view(-1).view(torch.uint8))
++            if ctx.sel is not None:
++                sel, cnt = ctx.sel
++                send[nx:nx + ns].copy_(sel.to(torch.int32).contiguous().view(-1).view(torch.uint8))
++                send[nx + ns:nx + ns + nc].copy_(cnt.to(torch.int32).contiguous().view(-1).view(torch.uint8))
++            if not stage.last:
++                cf = st.coefs[st.cur]
++                o = nx + ns + nc
++                for t_, n_ in ((st.gathered, ng), (cf.pre, npre), (cf.post, npost), (cf.comb, ncomb)):
++                    send[o:o + n_].copy_(t_.float().contiguous().view(-1).view(torch.uint8))
++                    o += n_
++            off = nx + ns + nc + npend
++            for L in srcs:
++                if L in stage.sources:
++                    p = stage.pack(L, k * C, C)
++                    send[off:off + p.numel()].copy_(p)
++                off += pay[L]
++            if stage.last and k < a.compare:
++                outs[k] = (st.x.float().clone(), st.out.float().clone())
++            torch.cuda.synchronize()
++            comp_s.append(time.perf_counter() - tb)
++        fast_gather(comm, send, recv)
++        got = recv.view(W, nb)
++        # the kv sources' rows from every rank's round (chunk t - q on rank q)
++        off = nx + ns + nc + npend
++        for L in srcs:
++            q = owner[L]
++            kq = t - q
++            if q != r and 0 <= kq < P:
++                stage.unpack(L, kq * C, C, got[q, off:off + pay[L]])
++            off += pay[L]
++        if r > 0 and 0 <= t - r + 1 < P:          # next round's input: the previous rank's output of this round
++            prev = got[r - 1]
++            x_in = prev[:nx].view(torch.bfloat16).view(C, D4).clone()
++            sel = prev[nx:nx + ns].view(torch.int32).view(C, cfg.index_topk).clone()
++            cnt = prev[nx + ns:nx + ns + nc].view(torch.int32).clone()
++            sel_in = (sel, cnt)
++            o = nx + ns + nc
++            pend = []
++            for shape, n_ in (((1, C, D), ng), ((C, 4), npre), ((C, 4), npost), ((C, 16), ncomb)):
++                pend.append(prev[o:o + n_].view(torch.float32).view(shape).clone())
++                o += n_
++            pend_in = tuple(pend)
++        torch.cuda.synchronize()
++        rounds.append(time.perf_counter() - ta)
++    total = time.perf_counter() - tp0
++
++    # -- report ---------------------------------------------------------------------------------------------------
++    cmp = []
++    if stage.last:
++        for k, (x, o) in sorted(outs.items()):
++            rx, ro = ref[k]
++            cmp.append({"chunk": k, "x_rel": float((x - rx).norm() / rx.norm()),
++                        "out_rel": float((o - ro).norm() / ro.norm()), "x_max": float((x - rx).abs().max())})
++    comp_med = sorted(comp_s)[len(comp_s) // 2] if comp_s else 0.0
++    stats = _gather_floats(comm, [comp_med, max(comp_s or [0.0]), load_s, boot])
++    flat = [v for c in cmp for v in (c["x_rel"], c["out_rel"])] + [0.0] * (2 * a.compare - 2 * len(cmp))
++    cmps = _gather_floats(comm, flat[:2 * a.compare] or [0.0])
++    if a.debug and tp_trace:            # a noise yardstick: the TP forward against itself with its exact kernels
++        fw.reset(0)
++        fw.fast_prefill, fast = False, fw.fast_prefill
++        fw.trace = {}
++        fw.run([Seg(0, 0, tuple(ids[:C]))], logits=False, prefill=True, upto=20)
++        fw.keep(0, C - 1)
++        alt = {L: v.float() for L, v in fw.trace.items()}
++        fw.trace, fw.fast_prefill = None, fast
++        noise = [(L, round(float((alt[L] - tp_trace[L]).norm() / tp_trace[L].norm()), 5)) for L in sorted(alt)
++                 if L in tp_trace]
++        print(f"[ppbench r{r}] debug noise: TP fast vs TP exact kernels, chunk 0, (L, rel): {noise}", flush=True)
++    if a.debug:
++        print(f"[ppbench r{r}] debug chunk 0: input vs TP layer {bounds[r] - 1}: {dbg}; layers (L, rel err): "
++              f"{[(L, round(e, 5)) for L, e in dbg_layers]}; selection/rows checks {[round(v, 4) for v in dbg_sel]}",
++              flush=True)
++    if r == 0:
++        steady = sorted(rounds[W:P - 1])
++        rep = {"chunks": P, "rows": C, "bounds": bounds, "total_s": total, "round_s": rounds,
++               "round_median_s": steady[len(steady) // 2] if steady else None,
++               "stage_compute_median_s": [s[0] for s in stats], "stage_compute_max_s": [s[1] for s in stats],
++               "stage_load_s": [s[2] for s in stats], "boot_s": boot, "tp_chunk_s": tp_s,
++               "compare_last_stage": cmps[W - 1], "exchange_bytes_per_rank": nb}
++        Path("/out/ppbench.json").write_text(json.dumps(rep, indent=1))
++        log(f"pipeline {P} chunks x {C} rows: {total:.1f} s; round median {rep['round_median_s']:.3f} s; "
++            f"stage compute medians {[round(s[0], 3) for s in stats]}; TP chunks {[round(v, 3) for v in tp_s]}; "
++            f"compare (x_rel, out_rel per chunk) {[round(v, 5) for v in cmps[W - 1]]}")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/prefill_mm.py b/src/tensorfold/families/deepseek_v41/cuda/prefill_mm.py
+index fc81b9c72fe2288ee4dd47d03f24443d12f48230..2f8aae477478c8b25af6640820e3a3da7dd530bb 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/prefill_mm.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/prefill_mm.py
+@@ -128,9 +128,12 @@ def gemm_tiles(k: int, n: int) -> tuple[int, int, int, int, int]:
+ def tag_grid() -> int:
+     """The session tag's prefill field (``sessions.Tag.grid``): 0 for exact; fast prompts on the 16-token snapshot
+     grid, one value a fast kernel set (16: grouped routed experts, 32: tc, 48: gm; + 1 with the fused prefill
+-    attention, G7)."""
++    attention, G7; + 2 with pipelined prompts, ``pipe``)."""
+ 
+-    return 0 if mode() == "exact" else 16 * (1 + experts_variant()) + attn_variant()
++    import os
++
++    pipe = int(os.environ.get("TF_DSV41_PREFILL_PIPE", "0").strip() or 0) > 0     # pipelined prompts: one rank's bits
++    return 0 if mode() == "exact" else 16 * (1 + experts_variant()) + attn_variant() + (2 if pipe else 0)
  
  
- __all__ = ["ENV", "TcpLink", "make", "mode", "port_for"]
+ @contextmanager
 diff --git a/src/tensorfold/families/deepseek_v41/cuda/slots.py b/src/tensorfold/families/deepseek_v41/cuda/slots.py
-index c5d3740..c0b34e5 100644
+index ad10a5c5486c7e296a5b9fab72ea0fbe4dfeb139..2500c96b5feb81f51024aae3c5543aaf4edfc211 100644
 --- a/src/tensorfold/families/deepseek_v41/cuda/slots.py
 +++ b/src/tensorfold/families/deepseek_v41/cuda/slots.py
 @@ -47,6 +47,58 @@ class _CandFetch:
@@ -566,12 +2529,26 @@ index c5d3740..c0b34e5 100644
  def prefill_runs(pieces, size: int) -> list[list[tuple[int, int, tuple]]]:
      """The forward runs of a round's pieces: each piece cut into segments of at most ``size`` rows, the k-th
      segment of every piece in run k (GLM 0560: one expert pass over every prefilling slot). ``prefetch.piece_runs``
-@@ -99,7 +151,11 @@ class SlotsForward(Forward):
+@@ -99,7 +151,25 @@ class SlotsForward(Forward):
          if mode == "replay":                    # CED: the encoder pass (``replay.encode``)
              from . import replay
  
 -            replay.encode(self, prefill_runs(pieces, self.pchunk))
 +            runs = prefill_runs(pieces, self.pchunk)
++            pipe = getattr(self, "pipe", None)
++            if pipe is not None:                # TF_DSV41_PREFILL_PIPE: long prompts' segments through the stages
++                for run in runs:
++                    rest = []
++                    for sg in run:
++                        if pipe.takes(sg[0], len(sg[2]), sg[2]):
++                            pipe.step(*sg)
++                        else:
++                            if pipe.slot == sg[0]:      # an image segment of a pipelined prompt: the line first
++                                pipe.drain()
++                            rest.append(sg)
++                    if rest:
++                        replay.encode(self, [rest])
++                return
 +            if _profile_due(pieces):
 +                _profiled(lambda: replay.encode(self, runs), self)
 +            else:
@@ -579,8 +2556,133 @@ index c5d3740..c0b34e5 100644
              return
          if mode != "full":
              raise ValueError(f"prefill mode {mode!r}: full or replay")
+@@ -115,6 +185,7 @@ class SlotsForward(Forward):
+                 self.keep(sg.slot, len(sg.ids) - 1)
+ 
+     def finish_prompt(self, slot: int, end: int, tail, *, mode: str = "full") -> None:
++        self._settle(slot)
+         if self.slots[slot].pos != end:
+             raise RuntimeError(f"slot {slot}: the prompt's prefilled part ends at {end}, the slot is at "
+                                f"{self.slots[slot].pos}")
+@@ -127,6 +198,9 @@ class SlotsForward(Forward):
+             self.replayed(slot, end - len(tail), taps)
+ 
+     def reset(self, slot: int = 0) -> None:
++        pipe = getattr(self, "pipe", None)
++        if pipe is not None:
++            pipe.abandon(slot)              # a reset (or restored) slot: its segments in the line are dropped
+         super().reset(slot)
+         self.stash.pop(slot, None)
+         self.cones.pop(slot, None)
+@@ -153,6 +227,13 @@ class SlotsForward(Forward):
+             c = self.__dict__["_cones"] = {}
+         return c
+ 
++    def _settle(self, slot: int) -> None:
++        """A pipelined prompt's state is whole before it is read (``pipe.Pipeline.drain``)."""
++
++        pipe = getattr(self, "pipe", None)
++        if pipe is not None and pipe.slot == slot:
++            pipe.drain()
++
+     def replayed(self, slot: int, start: int, taps: dict) -> None:
+         """After a CED replay: its rows' DSpark taps (``decode.DecodeForward`` feeds the drafter)."""
+ 
+@@ -168,6 +249,7 @@ class SlotsForward(Forward):
+     # -- verify windows ------------------------------------------------------------------------------------------
+     def window(self, windows, *, count: int, masks=None) -> Candidates:
+         segs = [Seg(w.slot, w.start, tuple(w.tokens)) for w in windows]
++        self.cand_reserve(sum(len(w.tokens) for w in windows), count)
+         logits = self.run(segs)
+         return self.candidates(logits, [len(w.tokens) for w in windows], count, masks)
+ 
+@@ -199,9 +281,7 @@ class SlotsForward(Forward):
+                     allowed[a:a + n] = bits.reshape(n, -1)[:, :vl].bool()
+                 a += n
+             lg = lg.masked_fill(~allowed, float("-inf"))
+-        k = min(int(count), vl)
+-        vals, ids = P.top(lg, k)                    # ties: the lower id (the kit's argmax)
+-        ids = (ids + lo).to(torch.int32)
++        vals, ids, k = P.rank_top(lg, count, lo, self.vocab_wide)   # ties: the lower id; one k on every rank
+         packed = torch.cat([vals, ids.view(torch.float32)], 1).contiguous()
+         if self.world > 1:
+             got = torch.empty((self.world * packed.numel(),), dtype=torch.float32, device=packed.device)
+@@ -209,6 +289,52 @@ class SlotsForward(Forward):
+             return got.view(self.world, R, 2 * k), k
+         return packed.view(1, R, 2 * k), k
+ 
++    def cand_warm(self, rows: int = 4) -> None:
++        """Run every candidate width class once at boot (every rank, the same calls), so their kernels are loaded
++        before serving: verify-window counts, a nucleus row's 512, wide top_k, the whole vocabulary (masked nucleus
++        rows), and the device sampler (``vsample.choose``, the speculative pass) over each.
++
++        Why (2026-10-05, four Sparks): with CUDA's lazy module loading, the first window that needed the large-k
++        top-k and large-row sort kernels (a sampled request with top_k in the tens of thousands) loaded them while
++        the window's forward was still running, and module loading waits for the device: the forward's Engram gate
++        and the RoCE exchanges wait for host threads, and every follower timed out at layer 14. A masked nucleus
++        request, whose full-vocabulary candidates come after its window, had loaded them first in every run that
++        passed."""
++
++        from . import nucleus as NU
++        from . import vsample as VS
++
++        vl = int(self.embed.shape[0])                       # this rank's vocabulary columns
++        dev = self.device
++        lg = torch.linspace(-4.0, 4.0, rows * vl, device=dev).view(rows, vl).to(torch.bfloat16).float()
++        z = torch.zeros((rows,), dtype=torch.int64, device=dev)
++        floats = torch.tensor([[1.0, 0.9, 0.02]] * rows, dtype=torch.float64, device=dev)
++        for count in (1, 9, 64, 520, 4104, 32776, self.vocab):
++            g, k = self.cand_gather(lg, [rows], count)
++            h = self.cand_fetch(g, k, count)
++            for mode in ((0, 0), (20, 1), (0, 1)):
++                ints = torch.tensor([list(mode)] * rows, dtype=torch.int64, device=dev)
++                VS.choose(h.vals, h.ids, z, z, ints, floats)
++            self.cand_wait(h)
++        NU.row_stats(lg, torch.ones((rows,), dtype=torch.float64))
++        if dev.type == "cuda":
++            torch.cuda.synchronize(dev)
++
++    def cand_reserve(self, rows: int, count: int) -> None:
++        """Grow the candidates' pinned buffer for ``rows`` rows of ``count`` before the window's forward is queued.
++
++        Pinned host memory comes from ``cudaHostAlloc``, which can wait for the device. Grown inside ``cand_fetch``
++        (after the forward is queued), the first window wider than any before (a sampled request with top_k in the
++        tens of thousands) waited on a forward whose Engram gate (``engram_gate``) was still waiting for this rank's
++        row reads: every follower timed out at layer 14 (2026-10-05, four Sparks; masked nucleus rows, whose full-
++        vocabulary candidates are fetched after the window, had grown it first in the runs that passed)."""
++
++        k = min(int(count), self.vocab_wide)
++        need = max(int(rows) * 2 * min(int(count), self.world * k), 4096)
++        buf = self.__dict__.get("_cand_pin")
++        if self.device.type == "cuda" and (buf is None or buf.numel() < need):
++            self.__dict__["_cand_pin"] = torch.empty((need,), dtype=torch.float32, pin_memory=True)
++
+     def cand_fetch(self, g: torch.Tensor, k: int, count: int):
+         """The merged, sorted candidates (``vsample.merge``: the order ``np.lexsort((ids, -values))`` gave on the
+         host) copied to pinned memory without blocking: a handle for ``cand_wait``; the device rows are ``.dev``."""
+@@ -247,6 +373,7 @@ class SlotsForward(Forward):
+         return torch.arange(lo, pos, dtype=torch.long) % self.ring
+ 
+     def snapshot(self, slot: int) -> Bounded:
++        self._settle(slot)
+         s = self.slots[slot]
+         rows = self._ring_rows(s.pos)
+         arrays: dict[str, np.ndarray] = {}
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/stack.py b/src/tensorfold/families/deepseek_v41/cuda/stack.py
+index ef259b58356b528cd9d3fb880c3010d87f3ac4de..230a40c92ef81fe58bca0c7a0024996e088090b5 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/stack.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/stack.py
+@@ -68,7 +68,7 @@ def build(fwd, topo, *, rank: int, link, model_dir, eos: Sequence[int], slots: i
+     store = None
+     if (os.environ.get("TF_DSV41_SESSIONS", "1").strip() or "1") != "0":
+         ident = sessdisk.compat_ident(image=image, knobs={k: os.environ.get(k, "") for k in BYTE_KNOBS},
+-                                      layout=compat_extra(tag, topo), extra={"page": pool.page})
++                                      layout=compat_extra(tag, topo), extra={"page": pool.page, "world": int(getattr(fwd, "world", 1))})  # TP=2 / TP=4 bytes differ
+         disk = sessdisk.from_env(rank, ident)
+         store = Store(pool, ram_bytes=int(os.environ.get("TF_DSV41_SESSION_RAM_MIB", "256") or 256) << 20, disk=disk)
+     host = Host(model_dir, topo.vocab, eos, quiet=quiet or rank != 0)
 diff --git a/src/tensorfold/families/deepseek_v41/cuda/weights.py b/src/tensorfold/families/deepseek_v41/cuda/weights.py
-index 019be4c..8845673 100644
+index 019be4c1b1c60996f8e2f5ea7fb1af9c221f5bbb..88456736c57c89572dfec99ad9ae65ad3cd0f251 100644
 --- a/src/tensorfold/families/deepseek_v41/cuda/weights.py
 +++ b/src/tensorfold/families/deepseek_v41/cuda/weights.py
 @@ -238,15 +238,33 @@ class RankW:
@@ -670,10 +2772,10 @@ index 019be4c..8845673 100644
  
  
 diff --git a/src/tensorfold/families/deepseek_v41/cuda/x3gm.py b/src/tensorfold/families/deepseek_v41/cuda/x3gm.py
-index 7b0b0d6..f416b65 100644
+index 7e097a68b91d75cdd7b4af1add348006628d3645..ab5d162e30a17b58a479c6e72b8a9645e7a7d7d0 100644
 --- a/src/tensorfold/families/deepseek_v41/cuda/x3gm.py
 +++ b/src/tensorfold/families/deepseek_v41/cuda/x3gm.py
-@@ -130,6 +130,15 @@ def supported(gate, up, down) -> str | None:
+@@ -235,6 +235,15 @@ def supported(gate, up, down) -> str | None:
      return None
  
  
@@ -689,7 +2791,7 @@ index 7b0b0d6..f416b65 100644
  def plan(pick: torch.Tensor, E: int, bm: int = BM):
      """Passes of a block's routed pairs, on the device, no host sync: (order, pe, poff, pcnt, npass). ``order`` is
      the pair indices (row * slots + slot) by expert, rows ascending; pass t is ``pcnt[t]`` members of expert
-@@ -138,7 +147,7 @@ def plan(pick: torch.Tensor, E: int, bm: int = BM):
+@@ -243,7 +252,7 @@ def plan(pick: torch.Tensor, E: int, bm: int = BM):
      flat = pick.reshape(-1).to(torch.int64)
      P = flat.numel()
      order = torch.argsort(flat, stable=True).to(torch.int32)
@@ -699,7 +2801,7 @@ index 7b0b0d6..f416b65 100644
      npe = (cnt + bm - 1) // bm
      pend = torch.cumsum(npe, 0)
 diff --git a/src/tensorfold/families/deepseek_v41/cuda/x3tc.py b/src/tensorfold/families/deepseek_v41/cuda/x3tc.py
-index 8869c42..4252cb9 100644
+index 8869c424222f68ec55515dd68817e9eb385d47b4..4252cb92131b3c2372b9dc649a29685879d55a9b 100644
 --- a/src/tensorfold/families/deepseek_v41/cuda/x3tc.py
 +++ b/src/tensorfold/families/deepseek_v41/cuda/x3tc.py
 @@ -231,7 +231,9 @@ def items(pick: torch.Tensor, E: int):
@@ -713,11 +2815,93 @@ index 8869c42..4252cb9 100644
      off = torch.cumsum(cnt, 0) - cnt
      blk = (cnt + BM - 1) // BM
      iend = torch.cumsum(blk, 0)
+diff --git a/src/tensorfold/families/glm5_next/spark/health.py b/src/tensorfold/families/glm5_next/spark/health.py
+index 642edf8da43e0634228a7637e44a73bb201f643c..cc12414caa1484b8ddb8ee5986c3de6c0e429036 100644
+--- a/src/tensorfold/families/glm5_next/spark/health.py
++++ b/src/tensorfold/families/glm5_next/spark/health.py
+@@ -204,8 +204,9 @@ class Health:
+         code = 503 if self.mode == "strict" and not body["ok"] else 200
+         return code, body
+ 
+-    def metrics(self, served: str = "") -> str:
+-        """Prometheus text exposition (counters and gauges, one ``model`` label)."""
++    def metrics(self, served: str = "", app=None) -> str:
++        """Prometheus text exposition (counters and gauges, one ``model`` label). With ``app``: also the
++        vLLM-named series that fleet dashboards and routers read (``vllm_view``)."""
+ 
+         with self.lock:
+             now = self.clock()
+@@ -238,8 +239,22 @@ class Health:
+             value = float(value)
+             shown = str(int(value)) if value.is_integer() else f"{value:.6f}"
+             out += [f"# HELP {name} {doc}", f"# TYPE {name} {kind}", f"{name}{label} {shown}"]
++        if app is not None:
++            out += vllm_view(self, app, served)
+         return "\n".join(out) + "\n"
+ 
++    def model_info(self, app) -> dict[str, Any]:
++        """``GET /v1/model_info``: the request slots and context as vLLM's debug model info names them
++        (``max_num_seqs``, ``max_model_len``), for tools that size their concurrency from it."""
++
++        view = engine_view(app)
++        out: dict[str, Any] = {"backend": "tensorfold"}
++        if "streams" in view:
++            out["max_num_seqs"] = view["streams"]["max"]
++        if "context_length" in view:
++            out["max_model_len"] = view["context_length"]
++        return out
++
+ 
+ # patches/0600: an engine's stats key -> upstream's /health total
+ STATS = {"prefill_s": "prefill_seconds_total", "decode_s": "decode_seconds_total", "cached": "cached_tokens_total",
+@@ -266,6 +281,42 @@ def engine_view(app) -> dict[str, Any]:
+     return out
+ 
+ 
++def vllm_view(health: Health, app, served: str = "") -> list[str]:
++    """The vLLM-named series dashboards and routers built for vLLM read (requests running / waiting, token and
++    finish counters), from this server's own numbers: a fleet dashboard (DGX-dash's ``LlmProbe``) then shows a
++    TensorFold engine's real slots and token rates instead of assuming one sequence."""
++
++    view = engine_view(app)
++    totals = health.totals_now()
++    with health.lock:
++        inflight = len(health.inflight)
++        requests, errors = int(health.counters["requests"]), int(health.counters["errors"])
++    streams = view.get("streams")
++    running = streams["decoding"] + streams["prefilling"] if streams else inflight
++    name = served.replace("\\", "\\\\").replace('"', '\\"')
++    label = f'model_name="{name}"'
++    rows = [
++        ("vllm:num_requests_running", "gauge", "requests in a slot (prefilling or decoding)", None, running),
++        ("vllm:num_requests_waiting", "gauge", "requests waiting for a slot", None, max(0, inflight - running)),
++        ("vllm:prompt_tokens_total", "counter", "prompt tokens", None, totals.get("prompt_tokens_total", 0)),
++        ("vllm:generation_tokens_total", "counter", "generated tokens (running replies included)", None,
++         totals.get("completion_tokens_total", 0)),
++        ("vllm:prompt_tokens_cached_total", "counter", "prompt tokens resumed from the session cache", None,
++         totals.get("cached_tokens_total", 0)),
++        ("vllm:request_success_total", "counter", "finished requests by reason", 'finished_reason="stop"',
++         max(0, requests - errors)),
++        ("vllm:request_success_total", "counter", "finished requests by reason", 'finished_reason="error"', errors),
++    ]
++    out, seen = [], set()
++    for metric, kind, doc, extra, value in rows:
++        if metric not in seen:
++            out += [f"# HELP {metric} {doc}", f"# TYPE {metric} {kind}"]
++            seen.add(metric)
++        labels = label + ("," + extra if extra else "")
++        out.append(f"{metric}{{{labels}}} {int(value)}")
++    return out
++
++
+ class TrackedEngine:
+     """``engine`` with ``generate`` going through ``Health`` (begin, a progress mark per token callback, end with
+     the stats or the exception). Every other attribute is the engine's own (read and written through)."""
 diff --git a/src/tensorfold/families/glm5_next/spark/roce.cpp b/src/tensorfold/families/glm5_next/spark/roce.cpp
-index 6654e3a..e753396 100644
+index e62ee663554c816e6eb39f3aab504a5810d63b60..302a4ef997b712fc1b72c67478cb510d7f12bc77 100644
 --- a/src/tensorfold/families/glm5_next/spark/roce.cpp
 +++ b/src/tensorfold/families/glm5_next/spark/roce.cpp
-@@ -469,10 +469,9 @@ class Proxy {
+@@ -609,10 +609,9 @@ class Proxy {
          const bool one = one_hca(nbytes, stripe_min_, n_hca_);          // patches/0460 (the kernel's rule)
          const int used = one ? single_hca(seq, n_hca_) : -1;
          single_ops_ += one ? 1 : 0;
@@ -731,9 +2915,770 @@ index 6654e3a..e753396 100644
              uint32_t pack_offset = 0;
              for (int h = 0; h < n_hca_; h++) {
                  if (used >= 0 && h != used) {
+diff --git a/src/tensorfold/families/glm5_next/spark/server.py b/src/tensorfold/families/glm5_next/spark/server.py
+index eceacf17738cfc597e38e08dcb8e17027ef03e2e..5928880a0ba7c251b5c66f0532365445af6ab976 100644
+--- a/src/tensorfold/families/glm5_next/spark/server.py
++++ b/src/tensorfold/families/glm5_next/spark/server.py
+@@ -923,8 +923,10 @@ def make_handler(app: App):
+                 self._json(200, {"object": "list", "data": [entry] + extra})
+             elif self.path.rstrip("/") in ("/health", "/v1/health"):
+                 self._json(*app.health.status(app))         # patches/0150; 0600: upstream's live totals too
++            elif self.path.rstrip("/") in ("/v1/model_info", "/v1/internal/model_info"):
++                self._json(200, app.health.model_info(app))     # slots / context as vLLM names them
+             elif self.path.rstrip("/") == "/metrics":       # patches/0150: Prometheus text
+-                data = app.health.metrics(app.served).encode()
++                data = app.health.metrics(app.served, app).encode()     # + vLLM-named series (dashboards)
+                 self.send_response(200)
+                 self.send_header("Content-Type", "text/plain; version=0.0.4")
+                 self.send_header("Content-Length", str(len(data)))
+diff --git a/tests/dsv41_fakes.py b/tests/dsv41_fakes.py
+index ca89c7994dd125322a540d913d82f87e64459001..9df8911e832b05ff5b5a00758ce5be5257815182 100644
+--- a/tests/dsv41_fakes.py
++++ b/tests/dsv41_fakes.py
+@@ -231,6 +231,9 @@ class _ThreadComm:
+         p = self.pair
+         p.slots[self.rank] = send.reshape(-1).clone()
+         p.bar.wait()
++        sizes = [int(x.numel()) for x in p.slots]
++        if len(set(sizes)) != 1:        # NCCL's contract: every rank sends the same count (else a hang or garbage)
++            raise RuntimeError(f"all_gather: ranks sent {sizes} elements")
+         recv.copy_(torch.cat(p.slots))
+         p.bar.wait()
+ 
+diff --git a/tests/test_dsv41_four_sparks.py b/tests/test_dsv41_four_sparks.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f256edd33e0cd8010287dd56ef594ea3ab7f3a45
+--- /dev/null
++++ b/tests/test_dsv41_four_sparks.py
+@@ -0,0 +1,431 @@
++# SPDX-License-Identifier: MIT
++"""Four ranks with uneven slices: the bugs jayleaton's review of the TP=4 port found (PR #6), each pinned here.
++
++- candidates over the vocabulary at any count (verify windows, nucleus rows' full vocabulary, DSpark): every rank
++  sends the same k (``pick.rank_top``: the widest slice's, narrower ones padded), so the all-gather agrees and the
++  merged rows equal one rank's (before: ``k = min(count, own width)``, a mismatched gather at count > 32,256);
++- the trimmed draft head's per-rank lists follow the 128-block vocabulary split (before: ``r * n``, rank 2 refused
++  to boot) and four ranks draft alike, greedy, sampled and nucleus (full-vocabulary candidates) requests;
++- the TCP plan link: followers say who they are; rank 0 refuses strays, duplicates and another world size, and
++  orders the connections by rank;
++- ``--tp 4`` only for a family that declares it (``CUDA_TP``);
++- ``TF_DSV41_PREFILL_ATTN_BMQ=32`` on a rank with 16 heads runs the fused kernel with 16 heads a program;
++- the NVMe session tier's directory differs between world sizes;
++- a DSpark delta's shards follow the weights' 128-block split.
++
++The thread communicator now refuses unequal all-gather sizes (NCCL's contract), so a mismatch fails here instead of
++hanging a Spark.
++"""
++
++from __future__ import annotations
++
++import queue
++import socket
++import threading
++
++import numpy as np
++import pytest
++
++torch = pytest.importorskip("torch")
++pytestmark = pytest.mark.torch
++
++import dsv41_dspark_fakes as DF  # noqa: E402
++import dsv41_fakes as FK  # noqa: E402
++
++from tensorfold.engine.exact_sampling import Sampling  # noqa: E402
++from tensorfold.families.deepseek_v41.cuda import numerics as N  # noqa: E402
++from tensorfold.families.deepseek_v41.cuda import pick as P  # noqa: E402
++from tensorfold.families.deepseek_v41.cuda import planlink as PL  # noqa: E402
++from tensorfold.families.deepseek_v41.cuda import vsample as VS  # noqa: E402
++from tensorfold.families.deepseek_v41.cuda.batch import Job  # noqa: E402
++from tensorfold.families.deepseek_v41.cuda.weights import block_bounds  # noqa: E402
++
++V4 = {"vocab_size": 640, "o_groups": 4, "moe_intermediate_size": 640}      # slices 256 / 128 / 128 / 128
++PROMPTS = [[int(t) for t in np.random.default_rng(70 + i).integers(3, 600, size=30 + 11 * i)] for i in range(3)]
++GREEDY, TOPK = None, Sampling(seed=7, temperature=0.8, top_k=20, top_p=0.95)
++NUCLEUS = Sampling(seed=11, temperature=1.1, top_k=0, top_p=0.9, min_p=0.02)    # full-vocabulary rows
++
++
++# -- candidates over uneven slices -----------------------------------------------------------------------------------
++def slices(V: int, W: int):
++    return [block_bounds(V, W, r) for r in range(W)]
++
++
++@pytest.mark.parametrize("count", [1, 5, 128, 129, 200, 256, 640])
++def test_rank_top_merges_to_the_whole_vocabulary(count):
++    V, W = 640, 4
++    g = torch.Generator().manual_seed(3)
++    lg = torch.randn((6, V), generator=g).to(torch.bfloat16).float()
++    lg[:, ::7] = lg[:, :1]                                  # ties across slices: the lower id first
++    lg[2, 100:300] = float("-inf")                          # masked tokens stay real candidates
++    wide = P.widest(V, W)
++    assert wide == 256
++    parts = [P.rank_top(lg[:, lo:hi], count, lo, wide) for lo, hi in slices(V, W)]
++    assert len({k for _, _, k in parts}) == 1               # one k: the gather's sizes agree
++    k = parts[0][2]
++    packed = [torch.cat([v, i.view(torch.float32)], 1) for v, i, _ in parts]
++    vals, ids = VS.merge(torch.stack(packed), k, count)
++    want_v, want_i = P.top(lg, count)
++    assert torch.equal(ids, want_i.to(torch.int64))
++    assert torch.equal(vals, want_v)
++    assert int(ids.max()) < V                               # never a pad
++
++
++def test_engine_choose_drops_the_padding():
++    """``engine.choose``'s host merge (greedy and sampled) sees real ids only."""
++
++    V, W = 640, 4
++    lg = torch.randn((3, V), generator=torch.Generator().manual_seed(9)).to(torch.bfloat16).float()
++    parts = [P.rank_top(lg[:, lo:hi], 300, lo, P.widest(V, W)) for lo, hi in slices(V, W)]
++    tokens = torch.cat([i for _, i, _ in parts], 1).numpy().astype(np.int64)
++    assert (tokens == P.PAD).any()
++    real = tokens[0] != P.PAD
++    assert all(((t == P.PAD) == ~real).all() for t in tokens)      # the same columns in every row
++    assert real.sum() == V
++
++
++@pytest.fixture(scope="module")
++def ck4(tmp_path_factory):
++    return DF.ckpt(tmp_path_factory.mktemp("dsv41tp4ds"), **V4)
++
++
++@pytest.fixture(scope="module")
++def ranking(tmp_path_factory):
++    f = tmp_path_factory.mktemp("dsv41rk") / "rank.txt"
++    f.write_text("# test ranking\n" + " ".join(map(str, list(range(1, 640, 2)) + list(range(0, 640, 2)))) + "\n")
++    return str(f)
++
++
++def test_candidates_full_vocabulary_on_four_ranks(ck4):
++    """A verify window's candidates at counts past the narrow slices (nucleus rows ask for the whole vocabulary)."""
++
++    from tensorfold.families.deepseek_v41.cuda.forward import Seg
++
++    ids = PROMPTS[0][:20]
++    pair = FK.ThreadPair(4)
++    comms = pair.comms()
++
++    def go(r):
++        f = DF.forward(ck4, rank=r, world=4, comm=comms[r], dspark=False)
++        lg = f.run([Seg(0, 0, tuple(ids))])
++        return [f.candidates(lg, [len(ids)], c) for c in (3, 200, 640)]
++
++    with N.exact():
++        got = pair.run([lambda r=r: go(r) for r in range(4)])
++        one = DF.forward(ck4, dspark=False)
++        lg1 = one.run([Seg(0, 0, tuple(ids))])
++        want = [one.candidates(lg1, [len(ids)], c) for c in (3, 200, 640)]
++    for rank in got:
++        for c, w in zip(rank, want):
++            assert np.array_equal(np.asarray(c.ids), np.asarray(w.ids))
++            assert np.allclose(np.asarray(c.values, dtype=np.float64), np.asarray(w.values, dtype=np.float64),
++                               rtol=0, atol=1e-9)
++    assert np.asarray(got[0][2].ids).shape[1] == 640
++
++
++class Fanout:
++    """Rank 0's plan to every follower (the batcher's ``Link``)."""
++
++    def __init__(self, world: int) -> None:
++        self.q = [queue.Queue() for _ in range(world)]
++
++    def sender(self):
++        outer = self
++
++        class S:
++            def send(self, plan):
++                for q in outer.q[1:]:
++                    q.put(list(plan))
++
++        return S()
++
++    def receiver(self, r: int):
++        q = self.q[r]
++
++        class R:
++            def recv(self):
++                return q.get(timeout=300)
++
++        return R()
++
++
++def test_four_ranks_trimmed_head_draft_alike(ck4, ranking, monkeypatch):
++    for k, v in {"TF_DSV41_DRAFT_HEAD": "trim:64", "TF_DSV41_DRAFT_VOCAB_FALLBACK": "off",
++                 "TF_DSV41_DRAFT_VOCAB": ranking}.items():
++        monkeypatch.setenv(k, v)
++    pair = FK.ThreadPair(4)
++    comms = pair.comms()
++    fws = pair.run([lambda r=r: DF.forward(ck4, slots=3, rank=r, world=4, comm=comms[r]) for r in range(4)])
++    heads = [f.drafter.head for f in fws]
++    assert [len(h.ids) for h in heads] == [64] * 4
++    for (lo, hi), h in zip(slices(640, 4), heads):
++        assert lo <= int(h.ids.min()) and int(h.ids.max()) < hi      # each rank lists its own slice
++    link = Fanout(4)
++    bs = [DF.batcher(ck4, fws[0], n=3, link=link.sender(), rank=0)]
++    bs += [DF.batcher(ck4, fws[r], n=3, link=link.receiver(r), rank=r) for r in range(1, 4)]
++    ts = [threading.Thread(target=b.follow, daemon=True) for b in bs[1:]]
++    for t in ts:
++        t.start()
++    got = DF.run(bs[0], [Job(list(PROMPTS[0]), 10, GREEDY), Job(list(PROMPTS[1]), 10, TOPK),
++                         Job(list(PROMPTS[2]), 10, NUCLEUS)])
++    bs[0].send_stop()
++    for t in ts:
++        t.join(timeout=300)
++        assert not t.is_alive()
++    assert all(len(g) == 10 for g in got)
++    assert all(0 <= t < 640 for g in got for t in g)
++
++
++def test_four_ranks_full_head_equal_one_rank(ck4, monkeypatch):
++    """Greedy, top-k and nucleus decoding on four ranks == one rank, token for token (exact numerics)."""
++
++    monkeypatch.delenv("TF_DSV41_DRAFT_HEAD", raising=False)
++    jobs = [(PROMPTS[0], 8, GREEDY), (PROMPTS[1], 8, TOPK), (PROMPTS[2], 8, NUCLEUS)]
++    with N.exact():
++        one = DF.run(DF.batcher(ck4, DF.forward(ck4, slots=3), n=3), [Job(list(p), n, s) for p, n, s in jobs])
++        pair = FK.ThreadPair(4)
++        comms = pair.comms()
++        fws = pair.run([lambda r=r: DF.forward(ck4, slots=3, rank=r, world=4, comm=comms[r]) for r in range(4)])
++        link = Fanout(4)
++        bs = [DF.batcher(ck4, fws[0], n=3, link=link.sender(), rank=0)]
++        bs += [DF.batcher(ck4, fws[r], n=3, link=link.receiver(r), rank=r) for r in range(1, 4)]
++        ts = [threading.Thread(target=b.follow, daemon=True) for b in bs[1:]]
++        for t in ts:
++            t.start()
++        four = DF.run(bs[0], [Job(list(p), n, s) for p, n, s in jobs])
++        bs[0].send_stop()
++        for t in ts:
++            t.join(timeout=300)
++    assert four == one
++
++
++# -- the TCP plan link -------------------------------------------------------------------------------------------
++def free_port() -> int:
++    with socket.socket() as s:
++        s.bind(("127.0.0.1", 0))
++        return s.getsockname()[1]
++
++
++def link_world(world: int, port: int, order, before=None, timeout: float = 20.0):
++    """Rank 0 and the followers ``order`` (ranks; connected in that order) on threads; ``before``: run first."""
++
++    out, err = {}, {}
++
++    def lead():
++        try:
++            out[0] = PL.TcpLink(0, "127.0.0.1", port, timeout_s=timeout, world=world)
++        except BaseException as e:      # noqa: BLE001
++            err[0] = e
++
++    def follow(r, w=world):
++        try:
++            out[r] = PL.TcpLink(r, "127.0.0.1", port, timeout_s=timeout, world=w)
++        except BaseException as e:      # noqa: BLE001
++            err[r] = e
++
++    t0 = threading.Thread(target=lead)
++    t0.start()
++    if before is not None:
++        before()
++    ts = []
++    for r in order:
++        t = threading.Thread(target=follow, args=r if isinstance(r, tuple) else (r,))
++        t.start()
++        t.join(timeout=timeout)
++        ts.append(t)
++    t0.join(timeout=timeout + 5)
++    return out, err
++
++
++def test_plan_link_four_ranks_in_rank_order():
++    port = free_port()
++    out, err = link_world(4, port, [3, 1, 2])
++    assert not err
++    lead = out[0]
++    lead.send([7, 8, 9])
++    for r in (1, 2, 3):
++        assert out[r].recv() == [7, 8, 9]
++    peers = [c.getpeername()[1] for c in lead.conns]
++    mine = [out[r].conn.getsockname()[1] for r in (1, 2, 3)]
++    assert peers == mine                                    # conns[i] is rank i + 1
++    for v in out.values():
++        v.close()
++
++
++def test_plan_link_refuses_strays_duplicates_and_other_worlds():
++    port = free_port()
++
++    def stray():
++        import time
++
++        for _ in range(200):
++            try:
++                s = socket.create_connection(("127.0.0.1", port), timeout=1)
++                break
++            except OSError:
++                time.sleep(0.02)
++        s.sendall(b"GET / HTTP/1.0\r\n\r\n")                # a port scanner / a web client
++        assert s.recv(1) in (PL.REFUSED, b"")
++        s.close()
++
++    out, err = link_world(4, port, [1, (2, 2), 1, 2, 3], before=stray)
++    # refused: rank 2 of a world of 2, then a second rank 1; then ranks 2 and 3 join
++    assert set(err) == {1, 2} and all(isinstance(e, ConnectionError) for e in err.values())
++    assert set(out) == {0, 1, 2, 3}
++    out[0].send([1])
++    assert [out[r].recv() for r in (1, 2, 3)] == [[1], [1], [1]]
++    for v in out.values():
++        v.close()
++
++
++def test_plan_link_names_the_missing_rank():
++    port = free_port()
++    out, err = link_world(4, port, [1, 3], timeout=2.0)
++    assert isinstance(err.get(0), TimeoutError) and "[2]" in str(err[0])
++
++
++# -- CLI, BMQ, session tier, DSpark delta ------------------------------------------------------------------------
++def test_tp4_only_for_families_that_declare_it(monkeypatch):
++    import argparse
++    import types
++
++    from tensorfold import cli
++
++    fam = types.SimpleNamespace(title="Other", package=types.SimpleNamespace())
++    args = argparse.Namespace(tp=4, rank=0, master="10.0.0.1")
++    with pytest.raises(ValueError, match="--tp 4: Other runs with --tp 1 / 2"):
++        cli._serve_cuda(args, fam, None)
++    from tensorfold.families import deepseek_v41
++
++    assert 4 in deepseek_v41.CUDA_TP
++
++
++def test_bmq_32_clamps_to_16_heads(monkeypatch):
++    from tensorfold.families.deepseek_v41.cuda.csa2 import attn_pf
++
++    monkeypatch.setenv("TF_DSV41_PREFILL_ATTN_BMQ", "32")
++    assert attn_pf.config(64)[0] == 32 and attn_pf.config(32)[0] == 32     # TP=2, the pipeline's stages
++    assert attn_pf.config(16)[0] == 16                                      # TP=4
++    assert attn_pf.config(8)[0] == 32                                       # synthetic: chunk kernels (backend)
++
++
++def test_session_tier_directory_depends_on_world(tmp_path):
++    from tensorfold.families.deepseek_v41.cuda import sessdisk
++
++    a = sessdisk.compat_hash(sessdisk.compat_ident(image="x", knobs={}, layout={}, extra={"page": 256, "world": 2}))
++    b = sessdisk.compat_hash(sessdisk.compat_ident(image="x", knobs={}, layout={}, extra={"page": 256, "world": 4}))
++    assert a != b
++    src = __import__("inspect").getsource(__import__("tensorfold.families.deepseek_v41.cuda.stack",
++                                                     fromlist=["build"]).build)
++    assert '"world"' in src
++
++
++def test_dspark_delta_shards_follow_the_block_split():
++    from tensorfold.families.deepseek_v41.cuda import dsparkdelta as DD
++
++    A, B = torch.randn(8, 2304), torch.randn(2304, 8)
++    parts = [DD.shard("col", A, B, r, 4)[1] for r in range(4)]
++    assert [p.shape[0] for p in parts] == [640, 640, 512, 512]
++    assert torch.equal(torch.cat(parts), B)
++    rows = [DD.shard("row", A, B, r, 4)[0] for r in range(4)]
++    assert torch.equal(torch.cat(rows, 1), A)
++    assert [DD.shard("col", A, torch.randn(1024, 8), r, 2)[1].shape[0] for r in range(2)] == [512, 512]
++
++
++def test_candidates_pinned_buffer_grows_before_the_forward(ck4):
++    """``cand_reserve`` runs before a window's forward is queued, sized for the merged rows (``rows x 2 c``,
++    c = min(count, world x min(count, widest slice))): growing pinned memory after it waited on a forward whose
++    Engram gate was still waiting for row reads (top_k ~32,000-40,000 timed out every follower on four Sparks)."""
++
++    from tensorfold.families.deepseek_v41.cuda.protocol import Rows
++
++    fw = DF.forward(ck4, slots=1, dspark=False)
++    order = []
++    real_reserve, real_run = fw.cand_reserve, fw.run
++    fw.cand_reserve = lambda rows, count: order.append(("reserve", rows, count)) or real_reserve(rows, count)
++    fw.run = lambda segs, **k: order.append(("forward",)) or real_run(segs, **k)
++    fw.prefill([__import__("tensorfold.families.deepseek_v41.cuda.protocol", fromlist=["Piece"]).Piece(
++        0, 0, tuple(PROMPTS[0][:-1]))], mode="full")
++    order.clear()
++    fw.window([Rows(0, len(PROMPTS[0]) - 1, (PROMPTS[0][-1],))], count=300)
++    assert order[:2] == [("reserve", 1, 300), ("forward",)]
++
++
++def test_candidate_warmup_on_four_ranks(ck4):
++    """``cand_warm`` (boot, every rank): every width class through the gather, the merge and the device sampler,
++    at counts past the narrow slices, with equal exchange sizes on four ranks."""
++
++    pair = FK.ThreadPair(4)
++    comms = pair.comms()
++
++    def go(r):
++        f = DF.forward(ck4, rank=r, world=4, comm=comms[r], dspark=False)
++        f.cand_warm()
++        return True
++
++    assert all(pair.run([lambda r=r: go(r) for r in range(4)]))
++
++
++# -- G19's fail-fast and memory floor at four ranks ------------------------------------------------------------------
++def fates_of_four(usable=None):
++    """Rank 0 with a fate channel to each of three followers (socket pairs), every exit recorded."""
++
++    import io
++    import socket as S
++
++    from tensorfold.families.deepseek_v41.cuda import failfast as FF
++
++    exits = {r: [] for r in range(4)}
++    pairs = [S.socketpair() for _ in range(3)]
++    f0 = FF.Fate(0, [FF.Channel(0, a, r + 1) for r, (a, _) in enumerate(pairs)], exit_fn=exits[0].append,
++                 grace_s=0.05, report_s=0.05, out=io.StringIO())
++    fs = [FF.Fate(r + 1, FF.Channel(r + 1, b, 0), exit_fn=exits[r + 1].append, grace_s=0.05, report_s=0.05,
++                  usable=(lambda r=r: (usable or [8, 6, 9])[r] << 30), out=io.StringIO()) for r, (_, b) in enumerate(pairs)]
++    return f0, fs, exits
++
++
++def test_failfast_four_ranks_one_follower_fails_all_exit():
++    import time
++
++    f0, fs, exits = fates_of_four()
++    for f in [f0, *fs]:
++        f.start()
++    time.sleep(0.3)
++    fs[1].fatal(RuntimeError("boom"), "prefill")                    # rank 2
++    deadline = time.monotonic() + 5
++    while time.monotonic() < deadline and not all(exits[r] for r in range(4)):
++        time.sleep(0.05)
++    assert all(exits[r] == [70] for r in range(4)), exits
++    assert "rank 2 failed in prefill" in f0.dead
++
++
++def test_floor_reads_the_tightest_of_three_followers():
++    import time
++
++    from tensorfold.families.deepseek_v41.cuda import memory as M
++
++    f0, fs, _ = fates_of_four([8, 6, 9])
++    for f in [f0, *fs]:
++        f.start()
++    deadline = time.monotonic() + 5
++    while time.monotonic() < deadline and f0.peer_mem() is None:
++        time.sleep(0.05)
++    got = f0.peer_mem()
++    assert got is not None and got[0] == 6 << 30 and got[2] == 2   # rank 2 is the tightest
++    floor = M.Floor(5.0, 4.0, meminfo=lambda: {"MemFree": 20 << 30, "MemAvailable": 20 << 30}, peer=f0.peer_mem)
++    assert floor.tight() == (2, 6 << 30)
++    assert floor.check(1 << 30) and not floor.check(3 << 30)         # 6 - 3 < 4 GiB hard floor on rank 2
++    for f in [f0, *fs]:
++        f.close()
++
++
++def test_image_segments_skip_the_prompt_pipeline():
++    from tensorfold.families.deepseek_v41.cuda import pipe as PP
++    from tensorfold.families.deepseek_v41.cuda.vision_prep import VBASE
++
++    p = PP.Pipeline.__new__(PP.Pipeline)
++    p.slot, p.min_rows = None, 16
++    assert p.takes(0, 64, list(range(64)))
++    assert not p.takes(0, 64, [5] * 63 + [VBASE + 3])
++    p.slot = 0
++    assert not p.takes(0, 64, [VBASE])                               # even mid-line: the caller drains first
+diff --git a/tests/test_dsv41_overlap.py b/tests/test_dsv41_overlap.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1dd7d05232112e5b27b9a2541335635002a800a1
+--- /dev/null
++++ b/tests/test_dsv41_overlap.py
+@@ -0,0 +1,118 @@
++# SPDX-License-Identifier: MIT
++"""Overlapped prefill (``TF_DSV41_PREFILL_OVERLAP``, ``Forward._run_overlap``) on threads, the CPU twin: a prefill
++segment run as two interleaved halves is the one-segment run bit for bit.
++
++- TP4 (uneven expert and vocabulary splits): a prefill's logits, the state ``keep`` leaves (the next verify rows'
++  logits) and the ratio-2 carries, even and odd segments;
++- TP2, CED replay with a long prompt (160 tokens, segments of 64 and a 31-row tail): the replayed prompt's logits
++  and the encoder state (rings, compressed rows, index keys) after it.
++
++On the CPU the exchanges run at once (no exchange stream): these tests pin the split itself (contexts, the carry
++from the first half, the stitched streams, ``Pending``); the GPU path differs only in where the same all-gather runs.
++"""
++
++from __future__ import annotations
++
++import json
++
++import numpy as np
++import pytest
++
++torch = pytest.importorskip("torch")
++pytestmark = pytest.mark.torch
++
++import dsv41_fakes as FK  # noqa: E402
++import test_dsv41_replay as RT  # noqa: E402
++
++from tensorfold.families.deepseek_v41.cuda import engram_host as EH  # noqa: E402
++from tensorfold.families.deepseek_v41.cuda import forward as FW  # noqa: E402
++from tensorfold.families.deepseek_v41.cuda import weights as W  # noqa: E402
++from tensorfold.families.deepseek_v41.cuda.config import Config  # noqa: E402
++from tensorfold.families.deepseek_v41.cuda.csa2.twin import Twin  # noqa: E402
++
++TP4 = dict(num_attention_heads=4, o_groups=4, moe_intermediate_size=640, vocab_size=640)
++IDS = [int(t) for t in np.random.default_rng(7).integers(0, 640, size=41)]
++
++
++@pytest.fixture(scope="module")
++def ck4(tmp_path_factory):
++    root = FK.write_checkpoint(tmp_path_factory.mktemp("dsv41ov"), **TP4)
++    cfg = Config.from_dict(json.loads((root / "config.json").read_text()))
++    return root, cfg, FK.engram_table(cfg)
++
++
++def build4(ck, rank, comm, pchunk):
++    root, cfg, table = ck
++    tmap = FK.token_map(cfg)
++    tree = W.Loader(cfg, W.Shards(root), rank, 4).load(token_map=tmap)
++    rows = {L: EH.MemoryRows(r, s) for L, (r, s) in table.items()}
++    return FW.Forward(cfg, tree, csa2=Twin(cfg.qk_rope_head_dim, cfg.sliding_window), comm=comm, limit=256,
++                      chunk=4, pchunk=pchunk, engram_rows=rows, hasher=EH.NgramHasher(cfg, tmap))
++
++
++def tp4_prompt(ck, cuts, overlap, monkeypatch, split=0):
++    monkeypatch.setenv("TF_DSV41_PREFILL_OVERLAP", str(overlap))
++    monkeypatch.setenv("TF_DSV41_INDEX_SPLIT", str(split))
++    pair = FK.ThreadPair(4)
++    comms = pair.comms()
++    fws = [build4(ck, r, comms[r], pchunk=32) for r in range(4)]
++    monkeypatch.delenv("TF_DSV41_PREFILL_OVERLAP")
++    monkeypatch.delenv("TF_DSV41_INDEX_SPLIT")
++
++    def go(f):
++        outs, a = [], 0
++        for b in cuts:
++            outs.append(f.run([FW.Seg(0, a, tuple(IDS[a:b]))], prefill=True))
++            f.keep(0, b - a - 1)
++            a = b
++        outs += [f.step([5]), f.step([9, 11, 3])]
++        carry = {L: c.clone() for L, c in f.slot.carry.items()}
++        return outs, carry
++
++    return fws, pair.run([lambda f=f: go(f) for f in fws])
++
++
++@pytest.mark.parametrize("cuts", [[32, 41], [7, 30, 41]])
++@pytest.mark.parametrize("overlap,split", [(2, 0), (0, 4), (2, 4)])
++def test_tp4_overlap_equals_one_segment(ck4, cuts, overlap, split, monkeypatch):
++    _, want = tp4_prompt(ck4, cuts, 0, monkeypatch)
++    fws, got = tp4_prompt(ck4, cuts, overlap, monkeypatch, split)
++    assert all(f.overlap == overlap and f.overlap_runs == (len(cuts) if overlap else 0) for f in fws)
++    if split:
++        assert all(f.rowsplit is not None and f.rowsplit.calls > 0 for f in fws)
++    for (wo, wc), (go, gc) in zip(want, got):
++        assert len(wo) == len(go)
++        for x, y in zip(wo, go):
++            assert torch.equal(x, y)
++        assert set(wc) == set(gc) and wc
++        for L in wc:
++            assert torch.equal(wc[L], gc[L]), L
++
++
++def replay_prompt(ck, overlap, monkeypatch, split=0):
++    monkeypatch.setenv("TF_DSV41_PREFILL_OVERLAP", str(overlap))
++    monkeypatch.setenv("TF_DSV41_INDEX_SPLIT", str(split))
++    pair = FK.ThreadPair(2)
++    comms = pair.comms()
++    fws = [RT.build(ck, pchunk=64, rank=r, world=2, comm=comms[r]) for r in range(2)]
++    monkeypatch.delenv("TF_DSV41_PREFILL_OVERLAP")
++    monkeypatch.delenv("TF_DSV41_INDEX_SPLIT")
++    got = pair.run([lambda f=f: (RT.prompt(f, RT.LONG, "replay"), RT.encoder_state(f)) for f in fws])
++    assert all(f.overlap_runs == (3 if overlap else 0) for f in fws)     # 64 + 64 + 31 rows
++    assert all((f.rowsplit is not None and f.rowsplit.calls > 0) == bool(split) for f in fws)
++    return got
++
++
++def test_tp2_replay_overlap_equals_one_segment(tmp_path_factory, monkeypatch):
++    root = FK.write_checkpoint(tmp_path_factory.mktemp("dsv41ovr"), **RT.SHAPES)
++    cfg = Config.from_dict(json.loads((root / "config.json").read_text()))
++    from tensorfold.families.deepseek_v41.cuda import topology
++
++    ck = (root, cfg, FK.engram_table(cfg), topology.load(root))
++    want = replay_prompt(ck, 0, monkeypatch)
++    got = replay_prompt(ck, 16, monkeypatch, split=8)
++    for (wl, ws), (gl, gs) in zip(want, got):
++        assert torch.equal(wl, gl)
++        assert set(ws) == set(gs)
++        for k in ws:
++            assert torch.equal(ws[k], gs[k]), k
+diff --git a/tests/test_dsv41_pipe.py b/tests/test_dsv41_pipe.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4f65d73d99b64569e165412ae60724e5eacf59ce
+--- /dev/null
++++ b/tests/test_dsv41_pipe.py
+@@ -0,0 +1,164 @@
++# SPDX-License-Identifier: MIT
++"""Pipelined prompt reading (``pipe.py``, ``TF_DSV41_PREFILL_PIPE``) on threads, the CPU twin, exact numerics:
++the stages run world-1 layers, which equal the tensor-parallel ones in exact numerics, so a pipelined prompt must
++leave the very state the tensor-parallel encoder pass leaves:
++
++(to the last bits of float64 sums: stage layers add a whole layer's terms where ranks add partials in rank order)
++
++- the replayed prompt's verify rows' logits (``finish_prompt`` drains the line, the decoder replays the stash);
++- the encoder state: every encoder layer's SWA ring, every kv source's compressed rows and index keys, the carries;
++- a snapshot in the middle of a prompt (the line drains first) and the rest of the prompt after it;
++- W = 2 and W = 4 (two stages with layers before the decoder, the last stage ending at its first site).
++"""
++
++from __future__ import annotations
++
++import json
++
++import numpy as np
++import pytest
++
++torch = pytest.importorskip("torch")
++pytestmark = pytest.mark.torch
++
++import dsv41_fakes as FK  # noqa: E402
++import test_dsv41_replay as RT  # noqa: E402
++
++from tensorfold.families.deepseek_v41.cuda import numerics as N  # noqa: E402
++from tensorfold.families.deepseek_v41.cuda import pipe as PP  # noqa: E402
++from tensorfold.families.deepseek_v41.cuda import topology  # noqa: E402
++from tensorfold.families.deepseek_v41.cuda.config import Config  # noqa: E402
++from tensorfold.families.deepseek_v41.cuda.protocol import Piece  # noqa: E402
++
++SHAPES4 = {**RT.SHAPES, "o_groups": 4, "moe_intermediate_size": 640, "vocab_size": 640}     # four 128-blocks
++LONG = [int(t) for t in np.random.default_rng(43).integers(3, 256, size=200)]
++
++
++def checkpoint(tmp_path_factory, shapes):
++    root = FK.write_checkpoint(tmp_path_factory.mktemp("dsv41pp"), **shapes)
++    cfg = Config.from_dict(json.loads((root / "config.json").read_text()))
++    return root, cfg, FK.engram_table(cfg), topology.load(root)
++
++
++def encoder_state(fw, slot: int = 0) -> dict:
++    """What a later read sees: every encoder layer's SWA rows of the last window, every kv source's compressed rows
++    and index keys up to the position (``RT.encoder_state`` without the ring rows no read reaches)."""
++
++    s, d = fw.slots[slot], RT.RP.decoder_start(fw.cfg)
++    win = torch.arange(max(0, s.pos - fw.cfg.sliding_window), s.pos) % fw.ring
++    out = {"pos": torch.tensor(s.pos), "tail": torch.tensor(list(s.tail))}
++    for L, ring in s.swa.items():
++        if L < d:
++            out[f"ring.{L}"] = ring.read(win)
++    for L, st in s.comp.items():
++        n = (s.pos + 1) // next(b.ratio for b in fw.blocks if b.index == L)
++        out[f"comp.{L}"] = st.read(torch.arange(n))
++        out[f"keys.{L}"] = s.ikeys[L].read(torch.arange(n))
++    sh = fw.stash.get(slot)
++    if sh is not None:
++        out.update({f"stash.{k}": torch.as_tensor(v) for k, v in sh.arrays().items()})
++    return out
++
++
++def carries(fw, slot: int = 0) -> dict:
++    return {f"carry.{L}": c.clone() for L, c in fw.slots[slot].carry.items()}
++
++
++class Mailbox:
++    """Point to point for the thread ranks (``NCCL.p2p``'s contract): a send is queued for its peer, a receive waits
++    for the sender's next tensor (a missing or extra call on either side hangs or fails, as with NCCL)."""
++
++    def __init__(self, world: int) -> None:
++        import queue
++
++        self.q = {(a, b): queue.Queue() for a in range(world) for b in range(world)}
++
++    def bind(self, comm) -> None:
++        def p2p(sends, recvs, rank=comm.rank):
++            for t, peer in sends:
++                self.q[(rank, int(peer))].put(t.detach().clone())
++            for t, peer in recvs:
++                got = self.q[(int(peer), rank)].get(timeout=60)
++                t.view(-1).copy_(got.view(-1))
++
++        comm.p2p = p2p
++
++
++def run(ck, world: int, pipe_rows: int, flow, p2p: bool = False):
++    pair = FK.ThreadPair(world)
++    comms = pair.comms()
++    if p2p:
++        box = Mailbox(world)
++        for c in comms:
++            box.bind(c)
++    fws = [RT.build(ck, pchunk=64, rank=r, world=world, comm=comms[r]) for r in range(world)]
++    if pipe_rows:
++        for f in fws:
++            f.pipe = PP.Pipeline(f, ck[0], pipe_rows)
++            assert (f.pipe.p2p is not None) == p2p
++
++    with N.exact():                     # one switch around every thread (it is the process's numerics)
++        return fws, pair.run([lambda f=f: flow(f) for f in fws])
++
++
++def whole(f):
++    logits = RT.prompt(f, LONG, "replay")
++    return logits, {**encoder_state(f), **carries(f)}
++
++
++def with_snapshot(f):
++    """A snapshot after the first 130 tokens (the line drains), then the rest: the snapshot and the end state."""
++
++    n = len(LONG)
++    f.prefill([Piece(0, 0, tuple(LONG[:130]))], mode="replay")
++    snap = f.snapshot(0)
++    f.prefill([Piece(0, 130, tuple(LONG[130:n - 1]))], mode="replay")
++    f.finish_prompt(0, n - 1, tuple(LONG[max(0, n - RT.RP.REPLAY):n - 1]), mode="replay")
++    logits = torch.cat([f.step([LONG[-1]]), f.step([7])])
++    return logits, {**encoder_state(f), **carries(f), **{f"snap.{k}": torch.as_tensor(v)
++                                                              for k, v in snap.arrays.items()}}
++
++
++def close(x, y) -> bool:
++    """Equal, or (float64 values) equal to the last bits a different sum order leaves (tests/test_dsv41_tp4.py:
++    one rank == four in exact numerics to 1e-10)."""
++
++    if torch.equal(x, y):
++        return True
++    if x.shape != y.shape or not x.is_floating_point():
++        return False
++    return float((x.double() - y.double()).abs().max()) <= 1e-10 * max(1.0, float(x.double().abs().max()))
++
++
++def same(a, b):
++    (la, sa), (lb, sb) = a, b
++    assert close(la, lb)
++    assert set(sa) == set(sb)
++    for k in sa:
++        assert close(sa[k], sb[k]), k
++
++
++@pytest.mark.parametrize("world,shapes,p2p", [(2, RT.SHAPES, False), (4, SHAPES4, False), (4, SHAPES4, True)])
++def test_pipelined_prompt_equals_tensor_parallel(tmp_path_factory, world, shapes, p2p):
++    ck = checkpoint(tmp_path_factory, shapes)
++    _, want = run(ck, world, 0, whole)
++    fws, got = run(ck, world, 16, whole, p2p=p2p)
++    assert all(f.pipe.segments == 4 and f.pipe.slot is None for f in fws)     # 64 + 64 + 64 + 7 rows, drained
++    assert fws[0].pipe.bounds[-1] == RT.RP.decoder_start(fws[0].cfg) + 1
++    for w, g in zip(want, got):
++        same(w, g)
++
++
++def test_pipelined_prompt_snapshot_mid_prompt(tmp_path_factory):
++    ck = checkpoint(tmp_path_factory, RT.SHAPES)
++    _, want = run(ck, 2, 0, with_snapshot)
++    fws, got = run(ck, 2, 16, with_snapshot)
++    assert all(f.pipe.segments > 0 for f in fws)
++    for w, g in zip(want, got):
++        same(w, g)
++
++
++def test_bounds():
++    cfg = Config.from_dict(json.loads(json.dumps(FK.TEXT)))         # compress ratios [0, 0, 2, 2, 1, ...]: D = 4
++    assert PP.bounds_for(cfg, 2) == [0, 2, 5]
++    assert PP.bounds_for(cfg, 4) == [0, 1, 2, 3, 5]
 diff --git a/tests/test_dsv41_tp4.py b/tests/test_dsv41_tp4.py
 new file mode 100644
-index 0000000..adcd61a
+index 0000000000000000000000000000000000000000..adcd61a3df78f4d57917cdfd047ae0a3289ecc4c
 --- /dev/null
 +++ b/tests/test_dsv41_tp4.py
 @@ -0,0 +1,160 @@
@@ -897,6 +3842,60 @@ index 0000000..adcd61a
 +    for E in (1, 8, 384):
 +        flat = torch.randint(0, E + 3, (5000,), generator=g)        # ids >= E are dropped like bincount[:E]
 +        assert torch.equal(_counts(flat, E), torch.bincount(flat, minlength=E)[:E])
--- 
-2.43.0
-
+diff --git a/tests/test_tensorfold_vllm_metrics.py b/tests/test_tensorfold_vllm_metrics.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5834fb02fc0d2abcbd9b84d1a52e6ed7af866173
+--- /dev/null
++++ b/tests/test_tensorfold_vllm_metrics.py
+@@ -0,0 +1,51 @@
++# SPDX-License-Identifier: MIT
++"""The vLLM-named series on ``/metrics`` and ``GET /v1/model_info`` (``glm5_next/spark/health.py``): dashboards and
++routers written for vLLM (DGX-dash's ``LlmProbe``, and the routers sized from it) read a TensorFold engine's real
++request slots, queue and token counters instead of assuming one sequence."""
++
++from __future__ import annotations
++
++import re
++import types
++
++from tensorfold.families.glm5_next.spark import health as H
++
++
++def app_with(slots: list, n: int = 4, limit: int = 300000):
++    batch = types.SimpleNamespace(seqs=slots, n=n)
++    engine = types.SimpleNamespace(batch=batch, limit=limit)
++    return types.SimpleNamespace(engine=engine, served="DeepSeek-V4.1-Flash-TF")
++
++
++def metric(text: str, name: str, extra: str = "") -> float:
++    m = re.search(r"^" + re.escape(name) + r"\{[^}]*" + re.escape(extra) + r"[^}]*\}\s+(\S+)$", text, re.M)
++    assert m, (name, extra)
++    return float(m.group(1))
++
++
++def test_vllm_series_and_model_info():
++    clock = [0.0]
++    h = H.Health(mode="basic", clock=lambda: clock[0])
++    done = h.begin(100)
++    h.progress(done, 7)
++    h.end(done, stats={"cached": 40}, completion_tokens=7)
++    bad = h.begin(5)
++    h.end(bad, error=ValueError("bad request"))
++    a, b, c = h.begin(1000), h.begin(2000), h.begin(30)              # three running, one waits for a slot
++    h.progress(a, 3)
++    decoding, prefilling = types.SimpleNamespace(stepper=object()), types.SimpleNamespace(stepper=None)
++    app = app_with([decoding, prefilling, None, None])
++    text = h.metrics(app.served, app)
++    assert metric(text, "vllm:num_requests_running") == 2
++    assert metric(text, "vllm:num_requests_waiting") == 1
++    assert metric(text, "vllm:prompt_tokens_total") == 105             # ended requests' prompts
++    assert metric(text, "vllm:generation_tokens_total") == 10          # 7 + the running reply's 3
++    assert metric(text, "vllm:prompt_tokens_cached_total") == 40
++    assert metric(text, "vllm:request_success_total", 'finished_reason="stop"') == 1
++    assert metric(text, "vllm:request_success_total", 'finished_reason="error"') == 1
++    assert 'model_name="DeepSeek-V4.1-Flash-TF"' in text
++    assert "tensorfold_requests_inflight" in text                      # the existing series are unchanged
++    assert h.model_info(app) == {"backend": "tensorfold", "max_num_seqs": 4, "max_model_len": 300000}
++    assert "vllm:" not in h.metrics(app.served)                         # without the app: as before
++    for rid in (a, b, c):
++        h.end(rid, completion_tokens=0)
