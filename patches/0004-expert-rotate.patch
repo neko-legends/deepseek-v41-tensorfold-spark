@@ -1,0 +1,888 @@
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/blocks.py b/src/tensorfold/families/deepseek_v41/cuda/blocks.py
+index 03aa8de..c43d7ae 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/blocks.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/blocks.py
+@@ -137,7 +137,7 @@ class Block:
+             moe = MO.GpuMoE(m.gate, m.bias, block, topk, cfg.routed_scaling_factor, cfg.swiglu_limit)
+         else:
+             experts = [MO.TwinExpert(materialize(m.w1.item(e), device), materialize(m.w2.item(e), device),
+-                                     materialize(m.w3.item(e), device)) for e in range(m.w1.trellis.shape[0])]
++                                     materialize(m.w3.item(e), device)) for e in range(m.w1.count)]
+             experts += [MO.TwinExpert(*(materialize(x, device) for x in s)) for s in m.shared]
+             moe = MO.TwinMoE(m.gate, m.bias, experts, topk, cfg.routed_scaling_factor, cfg.swiglu_limit)
+         moe.bias_vl = getattr(m, "bias_vl", None)          # image rows' routing bias (``vision.moe``), or None
+@@ -153,15 +153,18 @@ def gpu_experts(cfg: Config, m, layer: int, world: int, device):
+     from . import experts as X
+ 
+     def triples(st, extra):
+-        return [(st.trellis[e], st.suh[e], st.svh[e]) for e in range(st.trellis.shape[0])] + \
++        return [(st.trellis[e], st.suh[e], st.svh[e]) for e in range(st.count)] + \
+             [(t.trellis, t.suh, t.svh) for t in extra]
+ 
+     gate = triples(m.w1, [s[0] for s in m.shared])
+     up = triples(m.w3, [s[2] for s in m.shared])
+     down = triples(m.w2, [s[1] for s in m.shared])
+     _, topk = cfg.experts_of(layer)
+-    geom = X.Geometry(dims=cfg.hidden_size, inter=cfg.moe_intermediate_size, experts=m.w1.trellis.shape[0],
+-                      topk=topk, shared=len(m.shared), world=world, local=int(m.w1.trellis.shape[2]) * 16)
++    widths = [int(t.shape[1]) * 16 for t, _, _ in gate]
++    geom = X.Geometry(dims=cfg.hidden_size, inter=cfg.moe_intermediate_size, experts=m.w1.count,
++                      topk=topk, shared=len(m.shared), world=world, local=max(widths))
++    if len(set(widths)) > 1:                            # TF_DSV41_EXPERT_ROTATE: one width an expert
++        return X.Experts(X.prepare_ragged(gate, up, down, m.w1.codebook, device=device), geom, keep=[m])
+     return X.Experts(x3.prepare(gate, up, down, m.w1.codebook, device=device), geom, keep=[m])
+ 
+ 
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/calib.py b/src/tensorfold/families/deepseek_v41/cuda/calib.py
+index e47ad74..9f9d9fd 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/calib.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/calib.py
+@@ -119,7 +119,7 @@ KNOBS = ("TF_DSV41_GRAPHS", "TF_DSV41_GRAPH_BUCKET", "TF_DSV41_SWITCH_MS", "TF_D
+          "TF_DSV41_PDL", "TF_DSV41_DENSE_PD", "TF_DSV41_DENSE_PDL", "TF_DSV41_DENSE_SPLIT", "TF_DSV41_FUSED_PROJ_MINB",
+          "TF_DSV41_EXPERT_TOPP", "TF_DSV41_EXPERT_MIN_K", "TF_DSV41_EXPERT_MIN_W", "TF_DSV41_EXPERT_RENORM",
+          "TF_DSV41_DRAFT_EXPERT_TOPP", "TF_DSV41_DRAFT_EXPERT_MIN_K", "TF_DSV41_DRAFT_EXPERT_MIN_W",
+-         "TF_DSV41_EXPERT_BLOCK", "TF_DSV41_DRAFT_EXPERT_BLOCK", "TF_DSV41_EXPERT_LOADS_CFG",
++         "TF_DSV41_EXPERT_BLOCK", "TF_DSV41_DRAFT_EXPERT_BLOCK", "TF_DSV41_EXPERT_LOADS_CFG", "TF_DSV41_EXPERT_ROTATE",
+          "TF_DSV41_EXPERT_LOADS_PDL", "TF_DSV41_ROUTER_GEMV_CFG",
+          "TF_DSV41_ENGRAM_FUSE_DEC", "TF_DSV41_ENGRAM_GATE_ROWS", "TF_DSV41_ENGRAM_GATE_SPLIT",
+          "TF_DSV41_ENGRAM_GATE_CACHE", "TF_DSV41_PREFETCH", "TF_DSV41_PREFETCH_AHEAD", "TF_DSV41_PREFETCH_WORKERS",
+@@ -178,6 +178,10 @@ NOT_KNOBS = {
+     **{k: _HOST for k in ("TF_DSV41_HOST_TRIM_IDLE_S", "TF_DSV41_HOST_TRIM_IDLE_MIB", "TF_DSV41_HOST_TRIM_BUSY_S",
+                           "TF_DSV41_HOST_TRIM_BUSY_MIB", "TF_DSV41_HOST_TRIM_BG")},
+     "TF_DSV41_MEMPROBE_S": _DIAG,
++    # the four-Spark fork's prompt pipeline, split selections and overlapped exchanges (prefill only) and its traces
++    **{k: _PREFILL for k in ("TF_DSV41_PREFILL_OVERLAP", "TF_DSV41_INDEX_SPLIT", "TF_DSV41_PREFILL_PIPE",
++                             "TF_DSV41_PREFILL_PIPE_BOUNDS", "TF_DSV41_PIPE_P2P")},
++    **{k: _DIAG for k in ("TF_DSV41_PIPE_TRACE", "TF_DSV41_PREFILL_PROFILE", "TF_DSV41_PREFILL_PROFILE_DIR")},
+     **{k: _POLICY for k in ("TF_DSV41_CALIB", "TF_DSV41_DEPTH", "TF_DSV41_DRAFT_DEPTH", "TF_DSV41_DEPTH_JOINT",
+                             "TF_DSV41_DEPTH_FAIR", "TF_DSV41_DEPTH_HOST_MS",     # G15b joint depth mode 2
+                             "TF_DSV41_LOOKUP", "TF_DSV41_LOOKUP_MIN", "TF_DSV41_MAX_ROWS", "TF_DSV41_CONF_CAL",
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/draftcap.py b/src/tensorfold/families/deepseek_v41/cuda/draftcap.py
+index c820ce7..774fc79 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/draftcap.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/draftcap.py
+@@ -139,6 +139,7 @@ def main(argv=None) -> int:
+     ap.add_argument("--count", type=int, default=0)
+     ap.add_argument("--max", type=int, default=0, help="max tokens for every request (0: the prompt's)")
+     ap.add_argument("--repeat", type=int, default=1, help="the prompt set this many times (new seeds at T > 0)")
++    ap.add_argument("--world", type=int, default=2, help="ranks (2, or 4 on four Sparks)")
+     ap.add_argument("--minutes", type=float, default=0.0, help="stop launching requests after this long")
+     a = ap.parse_args(argv)
+     if a.rank == 0 and not os.environ.get("TF_DSV41_DRAFT_LOG"):
+@@ -147,7 +148,7 @@ def main(argv=None) -> int:
+     from .engine import Dsv41Engine
+ 
+     eng = Dsv41Engine(Path(a.model), rank=a.rank, master=a.master, port=a.port, context=a.context,
+-                      parallel=a.parallel, serving=True)
++                      parallel=a.parallel, serving=True, world=a.world)
+     if a.rank != 0:
+         eng.follow()
+         return 0
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/engine.py b/src/tensorfold/families/deepseek_v41/cuda/engine.py
+index 4648f8c..8853c26 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/engine.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/engine.py
+@@ -205,14 +205,14 @@ class Dsv41Engine:
+ 
+         bias_vl = os.environ.get("TF_DSV41_BIAS_VL", "").strip()
+         mine = [context, chunk, int(serial_only), int(tm_ident[:7], 16), parallel, int(serving), pchunk,
+-                prefill_mm.tag_grid(), int(bool(bias_vl))]
++                prefill_mm.tag_grid(), int(bool(bias_vl)), int(W.rotate_on())]
+         both = self._gather_ints(mine)
+         if any(b != both[0] for b in both):
+             raise RuntimeError(f"the ranks were started with different settings (context, TF_DSV41_CHUNK, "
+                                f"--no-drafts, Engram token map, --parallel, TF_DSV41_SERVING, "
+                                f"TF_DSV41_PREFILL_CHUNK, TF_DSV41_PREFILL_KERNELS / FAST_EXPERTS, "
+-                               f"TF_DSV41_BIAS_VL set): " + "; ".join(f"rank {r} {b}" for r, b in enumerate(both)))
+-        key = fastboot.weights_key(self.model_dir, rank, world, device=device, extra={"token_map": tm_ident})
++                               f"TF_DSV41_BIAS_VL set, TF_DSV41_EXPERT_ROTATE): " + "; ".join(f"rank {r} {b}" for r, b in enumerate(both)))
++        key = fastboot.weights_key(self.model_dir, rank, world, device=device, extra=fastboot.weights_extra(tm_ident))
+ 
+         def build():
+             return W.Loader(cfg, W.Shards(self.model_dir), rank, world, device,
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/expert_loads.py b/src/tensorfold/families/deepseek_v41/cuda/expert_loads.py
+index 2740ac6..2a4a452 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/expert_loads.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/expert_loads.py
+@@ -98,7 +98,7 @@ def _ext():
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    return load(name="tf_dsv41_x3ld_v1", sources=[str(here / "x3ld.cpp"), str(here / "x3ld.cu")],
++    return load(name="tf_dsv41_x3ld_v2", sources=[str(here / "x3ld.cpp"), str(here / "x3ld.cu")],
+                 extra_include_paths=[str(Path(upstream.__file__).parent)], extra_cuda_cflags=["-O3", "-lineinfo"],
+                 verbose=False)
+ 
+@@ -112,7 +112,7 @@ def _pdl_ok(device: int) -> bool:
+ 
+ def grouped(x0, x1, tp0, tp1, k2_0, k2_1, ids, count, members, z, mats: int, K: int, N: int, P: int, sk: int,
+             slots: int, cb: int, warps: int, lo: int, hi: int, *, probe: int = 0, cfg: tuple[int, int] | None = None,
+-            pdl: bool | None = None) -> bool:
++            pdl: bool | None = None, widths=None) -> bool:
+     """Upstream's ``ext.grouped(x0, x1, tp0, tp1, k2_0, k2_1, ids, count, members, z, mats, K, N, P, sk, slots, cb,
+     nt, warps, pf, lo, hi)`` through ``ld_kernel``, the same Z: (sk, warps) are upstream's setting (they fix the K
+     ranges), nt / pd ours. False: not taken (off, a shape, width or codebook it does not cover); the caller then runs
+@@ -125,6 +125,12 @@ def grouped(x0, x1, tp0, tp1, k2_0, k2_1, ids, count, members, z, mats: int, K:
+     rng = k2_range(lo, hi)
+     if rng is None or cb != 2 or not fits(K, N, sk, warps, cfg):
+         return False
++    ragged, min_w = 0, 0
++    if widths is not None:                          # TF_DSV41_EXPERT_ROTATE: gate / up (mats 2) N, down K per expert
++        widths, min_w = widths                      # (int32 [E] on the device, the narrowest: known at load)
++        ragged = 2 if mats == 1 else 1
++        if not (fits(min_w, N, sk, warps, cfg) if ragged == 2 else fits(K, min_w, sk, warps, cfg)):
++            return False
+     if probe and (probe != 3 or cfg not in PROBE_CFGS):
+         raise ValueError(f"no probe {probe} at {cfg}")
+     if pdl is None:                                 # G10: TF_DSV41_PDL (part experts) turns it on too
+@@ -133,5 +139,6 @@ def grouped(x0, x1, tp0, tp1, k2_0, k2_1, ids, count, members, z, mats: int, K:
+         pdl = CFG["pdl"] or "experts" in pdl_mod.parts()
+     pdl = bool(pdl) and _pdl_ok(x0.device.index or 0)
+     _ext().grouped(x0, x1, tp0, tp1, k2_0, k2_1, ids, count, members, z, mats, K, N, P, sk, slots, cb, cfg[0], cfg[1],
+-                   probe, rng[0], rng[1], pdl)
++                   probe, rng[0], rng[1], pdl, widths if widths is not None else k2_0, ragged, min_w)
+     return True
++
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/experts.py b/src/tensorfold/families/deepseek_v41/cuda/experts.py
+index 11caae9..fea647d 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/experts.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/experts.py
+@@ -267,6 +267,65 @@ def prepare_layer(routed: Sequence[Mapping[str, tuple]], shared: Sequence[Mappin
+     return Experts(x3.prepare(gate, up, down, CODEBOOK, device=device), geom)
+ 
+ 
++def prepare_ragged(gate: Sequence[tuple], up: Sequence[tuple], down: Sequence[tuple], codebook, device="cuda"):
++    """``tensorfold.cuda.exl3.experts.prepare`` for a block whose experts differ in width on this rank
++    (``TF_DSV41_EXPERT_ROTATE``): trellises referenced in place through the pointer tables (the kernels already
++    address an expert by pointer), the svh / suh stacks zero-padded to the widest expert, ``width`` that widest, and
++    ``widths`` int32 [E] (each expert's own) for ``x3ld``: gate / up stop at their expert's columns, down at its rows.
++    Only the x3ld load path runs such a block (``routed`` refuses upstream's grouped kernel)."""
++
++    import torch
++
++    from tensorfold.cuda.exl3 import experts as x3
++
++    cb = x3.codebook_id(codebook) if isinstance(codebook, str) else int(codebook)
++    E = len(gate)
++    if not (len(up) == len(down) == E) or E == 0:
++        raise ValueError("gate, up and down need the same, non-zero number of experts")
++    D = int(gate[0][0].shape[0]) * 16
++    widths = [int(t.shape[1]) * 16 for t, _, _ in gate]
++    I = max(widths)
++    keep = []
++
++    def table(mats, kind):
++        ptrs, k2s = [], []
++        for e, (t, _, _) in enumerate(mats):
++            if t.dtype != torch.int16 or not t.is_contiguous() or t.device.type != "cuda":
++                raise ValueError("trellis must be a contiguous CUDA int16 tensor")
++            want = (D, widths[e]) if kind == "gu" else (widths[e], D)
++            if (int(t.shape[0]) * 16, int(t.shape[1]) * 16) != want:
++                raise ValueError(f"expert {e}: shape {tuple(t.shape)} does not match {want} / 16")
++            if widths[e] % HAD:
++                raise ValueError(f"expert {e}: width {widths[e]} is not whole Hadamard blocks")
++            if t.data_ptr() % 16:
++                raise ValueError("trellis must be 16-byte aligned (the load path reads 16-byte words)")
++            k2s.append(k2_of(t.shape))
++            ptrs.append(t.data_ptr())
++            keep.append(t)
++        return (torch.tensor(ptrs, dtype=torch.int64, device=device),
++                torch.tensor(k2s, dtype=torch.int32, device=device), k2s)
++
++    gp, gk, gks = table(gate, "gu")
++    upp, uk, uks = table(up, "gu")
++    dp, dk, dks = table(down, "dn")
++
++    def stack(mats, j, n):
++        out = torch.zeros((E, n), dtype=torch.float16, device=device)
++        for e, m in enumerate(mats):
++            v = m[j].reshape(-1)
++            out[e, :v.numel()].copy_(v)
++        return out
++
++    tb = torch.tensor([(D * widths[e] // 256) * (gks[e] + uks[e] + dks[e]) * 16 for e in range(E)],
++                      dtype=torch.int64)
++    ex = x3.Exl3RoutedExperts(gp, upp, dp, gk, uk, dk, stack(gate, 1, D), stack(up, 1, D), stack(gate, 2, I),
++                              stack(up, 2, I), stack(down, 1, I), stack(down, 2, D), E, D, I, cb,
++                              (min(gks + uks), max(gks + uks)), (min(dks), max(dks)), tb, keep)
++    ex.widths = torch.tensor(widths, dtype=torch.int32, device=device)
++    ex.min_width = min(widths)
++    return ex
++
++
+ def scratch(layer: Experts, rows: int, device="cuda"):
+     """Upstream's ``Scratch`` for windows of up to ``rows`` rows with this block's slots and tile settings."""
+ 
+@@ -289,6 +348,9 @@ def routed(x, pick, wts, layer: Experts, s, out, R: int, *, limit: float = SWIGL
+     ex = layer.ex
+     ext = x3._ext()
+     D, I, E = ex.dims, ex.width, ex.count
++    wid = getattr(ex, "widths", None)               # TF_DSV41_EXPERT_ROTATE: one width an expert (x3ld only)
++    if wid is not None:
++        wid = (wid, ex.min_width)
+     slots = s.slots
+     P = R * slots
+     if R > s.rows:
+@@ -298,8 +360,12 @@ def routed(x, pick, wts, layer: Experts, s, out, R: int, *, limit: float = SWIGL
+         ext.group(pick, ids, s.count, members, R, slots, E)
+     ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E)
+     nt, w, sk, pf = s.cfg_gu
+-    if not prefill.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D,
+-                           I, P, sk, slots, ex.cb, w, ex.k2_gu[0], ex.k2_gu[1], rows=R) and \
++    if wid is not None:
++        if not loads.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2,
++                             D, I, P, sk, slots, ex.cb, w, ex.k2_gu[0], ex.k2_gu[1], widths=wid):
++            raise RuntimeError("TF_DSV41_EXPERT_ROTATE needs the x3ld load path (TF_DSV41_EXPERT_LOADS=1)")
++    elif not prefill.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2,
++                             D, I, P, sk, slots, ex.cb, w, ex.k2_gu[0], ex.k2_gu[1], rows=R) and \
+             not loads.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2,
+                               D, I, P, sk, slots, ex.cb, w, ex.k2_gu[0], ex.k2_gu[1]):
+         ext.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
+@@ -307,7 +373,11 @@ def routed(x, pick, wts, layer: Experts, s, out, R: int, *, limit: float = SWIGL
+     ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, sk, slots, E, float(limit),
+                         x3.ACT_F32)
+     nt, w, sk, pf = s.cfg_d
+-    if not prefill.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z,
++    if wid is not None:
++        if not loads.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members,
++                             s.z, 1, I, D, P, sk, slots, ex.cb, w, ex.k2_d[0], ex.k2_d[1], widths=wid):
++            raise RuntimeError("TF_DSV41_EXPERT_ROTATE needs the x3ld load path (TF_DSV41_EXPERT_LOADS=1)")
++    elif not prefill.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z,
+                            1, I, D, P, sk, slots, ex.cb, w, ex.k2_d[0], ex.k2_d[1], rows=R) and \
+             not loads.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z,
+                               1, I, D, P, sk, slots, ex.cb, w, ex.k2_d[0], ex.k2_d[1]):
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/fastboot.py b/src/tensorfold/families/deepseek_v41/cuda/fastboot.py
+index 1a10f4d..01c9284 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/fastboot.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/fastboot.py
+@@ -150,6 +150,17 @@ def weights_key(model_dir: str | Path, rank: int, world: int, *, device: str = "
+     return key
+ 
+ 
++def weights_extra(tm_ident: str) -> dict:
++    """The weights key's extra part: the token map, and ``TF_DSV41_EXPERT_ROTATE`` when on (other bytes)."""
++
++    from .weights import rotate_on
++
++    extra = {"token_map": tm_ident}
++    if rotate_on():
++        extra["expert_rotate"] = 1
++    return extra
++
++
+ def prepared_root(env: dict | None = None) -> Path | None:
+     v = (os.environ if env is None else env).get(ENV, "").strip()
+     return None if v.lower() in ("", "0", "off", "no", "false") else Path(v)
+@@ -542,7 +553,7 @@ def prepare(model_dir: Path, rank: int, world: int, root: Path, *, force: bool =
+ 
+     cfg = Config.from_file(Path(model_dir) / "config.json")
+     tmap, tm_ident = token_map_for(Path(model_dir), cfg)
+-    key = weights_key(model_dir, rank, world, device=device, extra={"token_map": tm_ident})
++    key = weights_key(model_dir, rank, world, device=device, extra=weights_extra(tm_ident))
+     d = folder(root, key)
+     ok, why = valid(d, key)
+     if ok and not force:
+@@ -582,7 +593,7 @@ def main(argv: list[str] | None = None) -> int:
+     from .engine import token_map_for
+ 
+     _, ident = token_map_for(Path(a.model_dir), Config.from_file(Path(a.model_dir) / "config.json"))
+-    key = weights_key(a.model_dir, a.rank, a.world, extra={"token_map": ident})
++    key = weights_key(a.model_dir, a.rank, a.world, extra=weights_extra(ident))
+     ok, why = valid(folder(Path(a.root), key), key)
+     print(f"{folder(Path(a.root), key)}: {why}")
+     return 0 if ok else 1
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/m2bench.py b/src/tensorfold/families/deepseek_v41/cuda/m2bench.py
+index 1cdda88..909a2e2 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/m2bench.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/m2bench.py
+@@ -426,6 +426,7 @@ def main(argv: list[str] | None = None) -> int:
+     ap.add_argument("--rank", type=int, required=True)
+     ap.add_argument("--master", required=True)
+     ap.add_argument("--port", type=int, default=29561)
++    ap.add_argument("--world", type=int, default=2, help="ranks (2, or 4 on four Sparks)")
+     ap.add_argument("--out", default="m2-report.json")
+     ap.add_argument("--context", type=int, default=16384)
+     ap.add_argument("--parallel", type=int, default=4)
+@@ -451,7 +452,7 @@ def main(argv: list[str] | None = None) -> int:
+ 
+     t0 = time.time()
+     eng = Dsv41Engine(Path(a.model), rank=a.rank, master=a.master, port=a.port, context=a.context,
+-                      parallel=a.parallel, serving=True)
++                      parallel=a.parallel, serving=True, world=a.world)
+     boot = round(time.time() - t0, 1)
+     if a.rank != 0:
+         eng.follow()
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/moe_fused.py b/src/tensorfold/families/deepseek_v41/cuda/moe_fused.py
+index 7460fca..948e660 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/moe_fused.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/moe_fused.py
+@@ -224,7 +224,8 @@ def eligible(moe, x: torch.Tensor, plan) -> bool:
+     blk, s = moe.block, moe.scratch
+     E = moe.gate.shape[0]
+     ge = E + 1 if CFG["shared"] == "inline" else E          # inline groups the shared entry too
+-    return (s is not None and blk.geom.shared == 1 and blk.ex.count == E + 1 and ge <= RG.GE_MAX
++    return (s is not None and getattr(blk.ex, "widths", None) is None     # TF_DSV41_EXPERT_ROTATE: experts.routed
++            and blk.geom.shared == 1 and blk.ex.count == E + 1 and ge <= RG.GE_MAX
+             and s.slots == moe.topk + 1 and x.shape[0] <= s.rows and moe.gate.is_contiguous())
+ 
+ 
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/weights.py b/src/tensorfold/families/deepseek_v41/cuda/weights.py
+index 8845673..0bb3ab9 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/weights.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/weights.py
+@@ -20,6 +20,13 @@ and a rank's matrix is exactly the slice of the full one):
+ | ``ffn.experts.E.w1/w3``, ``shared_experts.w1/w3`` | intermediate columns [r I / W, ...) |
+ | ``ffn.experts.E.w2``, ``shared_experts.w2`` | intermediate rows [r I / W, ...): a partial sum, exchanged |
+ | ``head`` | vocabulary columns [r V / W, ...) |
++
++Rotated expert split (``TF_DSV41_EXPERT_ROTATE=1``; only where the intermediate width does not split evenly, i.e.
++TP4's 2,304 = 18 blocks): expert ``e`` of a block gives rank r the slice ``block_bounds`` gives rank (r - e) mod W,
++so the 5-block slices travel round the ranks with the expert id instead of always landing on ranks 0 and 1 (the
++shared expert takes the offset ``SHARED_ROT``: its 5-block slices on ranks 2 and 3, away from rank 0's extra work).
++Columns and rows still partition exactly; only which rank holds which blocks of an expert moves. The stacks become
++``X3Ragged`` (one width an expert).
+ | the rest (``wq_a``, ``wkv``, compressor, indexer, norms, ``hc_*``, router, Engram ``wkv``) | all of it |
+ 
+ Dtypes as vLLM holds them: the router ``gate.weight`` and the indexer ``weights_proj`` (fp16 in the pack) are
+@@ -149,6 +156,28 @@ class X3Stack:
+     def item(self, e: int) -> X3:
+         return X3(self.trellis[e], self.suh[e], self.svh[e], self.codebook)
+ 
++    @property
++    def count(self) -> int:
++        return int(self.trellis.shape[0])
++
++
++@dataclass
++class X3Ragged:
++    """The routed experts of one projection whose slices differ in width by expert (``TF_DSV41_EXPERT_ROTATE``):
++    per expert trellis [K_e/16, N_e/16, W], suh [K_e], svh [N_e]."""
++
++    trellis: list
++    suh: list
++    svh: list
++    codebook: str
++
++    def item(self, e: int) -> X3:
++        return X3(self.trellis[e], self.suh[e], self.svh[e], self.codebook)
++
++    @property
++    def count(self) -> int:
++        return len(self.trellis)
++
+ 
+ @dataclass
+ class Hc:
+@@ -255,18 +284,43 @@ def block_bounds(n: int, world: int, rank: int, block: int = 128) -> tuple[int,
+     return lo * block, (lo + base + (1 if rank < extra else 0)) * block
+ 
+ 
++ENV_ROTATE = "TF_DSV41_EXPERT_ROTATE"
++SHARED_ROT = 2           # the shared expert's offset: its wide slices on ranks 2 and 3 at TP4
++
++
++def rotate_on(env: dict | None = None) -> bool:
++    """``TF_DSV41_EXPERT_ROTATE``: rotate the uneven expert split by expert id (every rank must agree)."""
++
++    v = (os.environ if env is None else env).get(ENV_ROTATE, "").strip().lower()
++    if v in ("", "0", "off", "false", "no"):
++        return False
++    if v in ("1", "on", "true", "yes"):
++        return True
++    raise ValueError(f"{ENV_ROTATE}={v!r}: expected 0 or 1")
++
++
++def expert_bounds(n: int, world: int, rank: int, e: int, rotate: bool, block: int = 128) -> tuple[int, int]:
++    """Rank ``rank``'s [lo, hi) of expert ``e``'s intermediate width ``n``: ``block_bounds`` of rank (rank - e) mod
++    world when ``rotate`` (and the split is uneven), else of ``rank``. The ranks' slices partition [0, n) either way."""
++
++    if rotate and (n // block) % world:
++        return block_bounds(n, world, (rank - e) % world, block)
++    return block_bounds(n, world, rank, block)
++
++
+ # -- the loader --------------------------------------------------------------------------------------------------
+ class Loader:
+     """Builds a rank's ``RankW`` from a checkpoint folder: ``Loader(cfg, Shards(dir), rank, world).load()``."""
+ 
+     def __init__(self, cfg: Config, src: Shards, rank: int, world: int, device="cpu",
+-                 bias_vl: Shards | None = None) -> None:
++                 bias_vl: Shards | None = None, rotate: bool | None = None) -> None:
+         if cfg.num_attention_heads % world or cfg.o_groups % world or cfg.vocab_size % 128:
+             raise ValueError(f"heads {cfg.num_attention_heads} and o_groups {cfg.o_groups} must split over {world} "
+                              f"ranks and the vocabulary {cfg.vocab_size} into blocks of 128")
+         block_bounds(cfg.vocab_size, world, rank)
+         self.cfg, self.src, self.rank, self.world, self.device = cfg, src, rank, world, torch.device(device)
+         self.bias_vl_src = bias_vl
++        self.rotate = rotate_on() if rotate is None else bool(rotate)
+ 
+     # primitives
+     def _dev(self, t: torch.Tensor) -> torch.Tensor:
+@@ -287,8 +341,9 @@ class Loader:
+                 return MARKERS[v]
+         return "3inst"
+ 
+-    def x3(self, prefix: str, split: str = "", on_device: bool = True) -> X3:
+-        """``split`` "" (whole), "col" (this rank's output columns) or "row" (this rank's input rows)."""
++    def x3(self, prefix: str, split: str = "", on_device: bool = True, bounds=None) -> X3:
++        """``split`` "" (whole), "col" (this rank's output columns) or "row" (this rank's input rows); ``bounds``
++        (lo, hi) of the split dimension instead of this rank's ``block_bounds`` (the rotated expert split)."""
+ 
+         parts, part = self.world, self.rank
+         tn = f"{prefix}.trellis"
+@@ -298,14 +353,14 @@ class Loader:
+         suh, svh = self.src.tensor(f"{prefix}.suh"), self.src.tensor(f"{prefix}.svh")
+         if split == "row":
+             try:
+-                lo, hi = block_bounds(kt * 16, parts, part)
++                lo, hi = bounds or block_bounds(kt * 16, parts, part)
+             except ValueError as e:
+                 raise ValueError(f"{prefix}: K={kt * 16}: {e}") from None
+             t = self.src.rows(tn, lo // 16, hi // 16)
+             suh = suh[lo:hi]
+         elif split == "col":
+             try:
+-                lo, hi = block_bounds(nt * 16, parts, part)
++                lo, hi = bounds or block_bounds(nt * 16, parts, part)
+             except ValueError as e:
+                 raise ValueError(f"{prefix}: N={nt * 16}: {e}") from None
+             t = self.src.tensor(tn)[:, lo // 16:hi // 16]
+@@ -342,11 +397,29 @@ class Loader:
+             out.ix_wp = self.native(f"{a}.indexer.weights_proj.weight", bf16_param=True)
+         return out
+ 
+-    def stack(self, f: str, n_exp: int, which: str, split: str) -> X3Stack:
+-        items = [self.x3(f"{f}.experts.{e}.{which}", split, on_device=False) for e in range(n_exp)]
++    def _ebounds(self, f: str, which: str, e: int, split: str):
++        """Expert ``e``'s rotated (lo, hi) of its intermediate dim, or None (this rank's plain ``block_bounds``)."""
++
++        if not self.rotate or self.world <= 1 or not split:
++            return None
++        name = f"{f}.{which}.trellis"
++        kt, nt, _ = self.src.info(name).shape
++        n = (nt if split == "col" else kt) * 16
++        return expert_bounds(n, self.world, self.rank, e, True)
++
++    def stack(self, f: str, n_exp: int, which: str, split: str) -> X3Stack | X3Ragged:
++        items = [self.x3(f"{f}.experts.{e}.{which}", split, on_device=False,
++                         bounds=self._ebounds(f"{f}.experts.{e}", which, e, split)) for e in range(n_exp)]
+         shapes = {tuple(x.trellis.shape) for x in items}
+-        if len(shapes) != 1 or len({x.codebook for x in items}) != 1:
+-            raise ValueError(f"{f}.experts.*.{which}: widths differ within the layer ({sorted(shapes)})")
++        if len({x.codebook for x in items}) != 1:
++            raise ValueError(f"{f}.experts.*.{which}: codebooks differ within the layer")
++        if len(shapes) != 1:
++            if not self.rotate:
++                raise ValueError(f"{f}.experts.*.{which}: widths differ within the layer ({sorted(shapes)})")
++            rg = X3Ragged([self._dev(x.trellis) for x in items], [self._dev(x.suh) for x in items],
++                          [self._dev(x.svh) for x in items], items[0].codebook)
++            del items
++            return rg
+         st = X3Stack(self._dev(torch.stack([x.trellis for x in items])), self._dev(torch.stack([x.suh for x in items])),
+                      self._dev(torch.stack([x.svh for x in items])), items[0].codebook)
+         del items
+@@ -355,8 +428,11 @@ class Loader:
+     def moe(self, layer: int, p: str) -> MoEW:
+         f = f"{p}.ffn"
+         n_exp, _ = self.cfg.experts_of(layer)
+-        shared = [(self.x3(f"{f}.shared_experts.w1", "col"), self.x3(f"{f}.shared_experts.w2", "row"),
+-                   self.x3(f"{f}.shared_experts.w3", "col"))] if f"{f}.shared_experts.w1.trellis" in self.src else []
++        sh = f"{f}.shared_experts"
++        shared = [(self.x3(f"{sh}.w1", "col", bounds=self._ebounds(sh, "w1", SHARED_ROT, "col")),
++                   self.x3(f"{sh}.w2", "row", bounds=self._ebounds(sh, "w2", SHARED_ROT, "row")),
++                   self.x3(f"{sh}.w3", "col", bounds=self._ebounds(sh, "w3", SHARED_ROT, "col")))] \
++            if f"{sh}.w1.trellis" in self.src else []
+         bias_vl = None
+         if self.bias_vl_src is not None and f"{f}.gate.bias_vl" in self.bias_vl_src:
+             bias_vl = self._dev(self.bias_vl_src.tensor(f"{f}.gate.bias_vl").to(torch.float32))
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/x3gm.py b/src/tensorfold/families/deepseek_v41/cuda/x3gm.py
+index ab5d162..a3d731f 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/x3gm.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/x3gm.py
+@@ -222,6 +222,8 @@ def words(trellis: torch.Tensor) -> torch.Tensor:
+ def supported(gate, up, down) -> str | None:
+     """None when the gm kernels take this block (``weights.X3Stack`` gate / up / down), else why not."""
+ 
++    if isinstance(gate.trellis, list):                  # TF_DSV41_EXPERT_ROTATE: widths differ by expert
++        return "ragged"
+     tg, tu, td = gate.trellis, up.trellis, down.trellis
+     if getattr(gate, "codebook", "mul1") != "mul1":
+         return "codebook"
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/x3ld.cpp b/src/tensorfold/families/deepseek_v41/cuda/x3ld.cpp
+index f993960..f4ed901 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/x3ld.cpp
++++ b/src/tensorfold/families/deepseek_v41/cuda/x3ld.cpp
+@@ -9,7 +9,8 @@
+ void dsv41_x3ld_grouped_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                              const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                              const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+-                             int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, bool);
++                             int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, bool, const at::Tensor&,
++                             int64_t, int64_t);
+ 
+ static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
+     TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), name,
+@@ -19,7 +20,8 @@ static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
+ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
+              const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
+              const at::Tensor& members, at::Tensor Z, int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK,
+-             int64_t slots, int64_t cb, int64_t nt, int64_t pd, int64_t probe, int64_t lo, int64_t hi, bool pdl) {
++             int64_t slots, int64_t cb, int64_t nt, int64_t pd, int64_t probe, int64_t lo, int64_t hi, bool pdl,
++             const at::Tensor& wid, int64_t ragged, int64_t min_width) {
+     check(X0, at::kHalf, "X0");
+     check(X1, at::kHalf, "X1");
+     check(TP0, at::kLong, "TP0");
+@@ -34,7 +36,7 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0,
+     TORCH_CHECK(X0.numel() >= P * K && X1.numel() >= P * K, "X too small");
+     c10::cuda::CUDAGuard guard(X0.device());
+     dsv41_x3ld_grouped_cuda(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, Z, mats, K, N, P, SK, slots, cb, nt, pd,
+-                            probe, lo, hi, pdl);
++                            probe, lo, hi, pdl, wid, ragged, min_width);
+ }
+ 
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/x3ld.cu b/src/tensorfold/families/deepseek_v41/cuda/x3ld.cu
+index cc3b7af..63da03e 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/x3ld.cu
++++ b/src/tensorfold/families/deepseek_v41/cuda/x3ld.cu
+@@ -158,7 +158,8 @@ __global__ void __launch_bounds__(W * 32, NT == 8 ? 3 : 4) ld_kernel(
+     const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
+     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
+     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
+-    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
++    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots, const int* __restrict__ wid,
++    int ragged) {
+     static_assert(PD >= 1 && PD <= 4, "PD 1-4");
+     const int u = blockIdx.x;
+     const int MT = (maxm + 15) / 16;
+@@ -183,7 +184,11 @@ __global__ void __launch_bounds__(W * 32, NT == 8 ? 3 : 4) ld_kernel(
+     const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
+     const int k2 = mat ? K2_1[e] : K2_0[e];
+     const half* X = mat ? X1 : X0;
+-    const int KT = K >> 4, NTILES = N >> 4;
++    // TF_DSV41_EXPERT_ROTATE: an expert's own width -- gate / up its columns (ragged 1), down its rows (ragged 2).
++    // K and N stay the strides of X and Z (the widest expert); the trellis is addressed with the expert's own tiles.
++    const int we = ragged ? __ldcg(wid + e) : 0;
++    const int KT = (ragged == 2 ? we : K) >> 4, NTILES = (ragged == 1 ? we : N) >> 4;
++    if (blockIdx.y * NT >= NTILES) return;                       // past this expert's columns (CTA-uniform)
+     const int per_split = KT / SK, per_warp = per_split / W;
+     const int kt0 = split * per_split + warp * per_warp;
+     const int nt0 = blockIdx.y * NT;
+@@ -261,6 +266,8 @@ struct Args {
+     const int* members;
+     float* z;
+     int K, N, P, SK, maxm, slots, nexp_max, mats;
++    const int* wid;
++    int ragged;
+ };
+ 
+ template <int CB, int NT, int PD, int LO, int HI, int PROBE>
+@@ -278,7 +285,7 @@ void launch(const Args& a, cudaStream_t stream, bool pdl) {
+     cfg.numAttrs = pdl ? 1 : 0;
+     C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, ld_kernel<CB, NT, PD, LO, HI, PROBE>, a.x0, a.x1, a.tp0, a.tp1, a.k2_0,
+                                       a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK, a.maxm,
+-                                      a.slots));
++                                      a.slots, a.wid, a.ragged));
+ }
+ 
+ // The instances: mul1 (this checkpoint's codebook); widths 8..8 (DSpark's 4-bit experts) and 2..10 (routed 2/3-bit
+@@ -297,12 +304,25 @@ void dsv41_x3ld_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const a
+                              const at::Tensor& TP1, const at::Tensor& B0, const at::Tensor& B1,
+                              const at::Tensor& uids, const at::Tensor& ucount, const at::Tensor& members, at::Tensor& Z,
+                              int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK, int64_t slots, int64_t cb,
+-                             int64_t nt, int64_t pd, int64_t probe, int64_t lo, int64_t hi, bool pdl) {
++                             int64_t nt, int64_t pd, int64_t probe, int64_t lo, int64_t hi, bool pdl,
++                             const at::Tensor& wid, int64_t ragged, int64_t min_width) {
+     using namespace dsv41_x3ld;
+     TORCH_CHECK(cb == 2, "x3ld: built for the mul1 codebook (cb 2) only");
+     TORCH_CHECK(K % (16 * SK * W) == 0 && N % (16 * nt) == 0, "K and N must split evenly");
+     const int64_t per_warp = K / (16 * SK * W);
+     TORCH_CHECK(per_warp >= pd && per_warp % pd == 0, "the k steps a warp must be a multiple of the ring depth");
++    TORCH_CHECK(ragged >= 0 && ragged <= 2, "ragged: 0 (one width), 1 (gate / up columns), 2 (down rows)");
++    if (ragged) {
++        TORCH_CHECK(wid.is_cuda() && wid.scalar_type() == at::kInt && wid.is_contiguous(), "wid: int32 CUDA");
++        // every expert's width (the host checks them all once at load) must split like the widest one
++        if (ragged == 2) {
++            TORCH_CHECK(min_width % (16 * SK * W) == 0, "an expert's rows must split into SK x W whole k ranges");
++            const int64_t pw = min_width / (16 * SK * W);
++            TORCH_CHECK(pw >= pd && pw % pd == 0, "an expert's k steps a warp must be a multiple of the ring depth");
++        } else {
++            TORCH_CHECK(min_width % (16 * nt) == 0, "an expert's columns must be whole programs of nt tiles");
++        }
++    }
+     TORCH_CHECK(members.size(0) == uids.size(0), "one member row a distinct-expert slot");
+     Args a;
+     a.x0 = reinterpret_cast<const half*>(X0.data_ptr());
+@@ -318,6 +338,8 @@ void dsv41_x3ld_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const a
+     a.K = (int)K; a.N = (int)N; a.P = (int)P; a.SK = (int)SK; a.maxm = (int)members.size(1); a.slots = (int)slots;
+     a.nexp_max = (int)uids.size(0);
+     a.mats = (int)mats;
++    a.wid = ragged ? wid.data_ptr<int>() : nullptr;
++    a.ragged = (int)ragged;
+     auto stream = at::cuda::getCurrentCUDAStream();
+     bool ok = false;
+     if (probe == 0) {
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/x3tc.py b/src/tensorfold/families/deepseek_v41/cuda/x3tc.py
+index 4252cb9..bfd2dc3 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/x3tc.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/x3tc.py
+@@ -280,11 +280,13 @@ class Buffers:
+         self.y = ybuf[:P * self.dh].view(P, self.dh)
+ 
+ 
+-def routed(moe, x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor, limit: float) -> torch.Tensor:
++def routed(moe, x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor, limit: float) -> torch.Tensor | None:
+     """This rank's routed experts' partial fp32 [R, D] for a fast prefill run (``prefill_moe``): ``pick`` / ``wts``
+     [R, 6] (routed slots only, the kit's fp16 weights)."""
+ 
+     m = moe.block.keep[0]
++    if isinstance(m.w1.trellis, list):                  # TF_DSV41_EXPERT_ROTATE: the grouped kernels take it
++        return None
+     return run(x, pick, wts, m.w1, m.w3, m.w2, limit, scratch=moe.scratch)
+ 
+ 
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/xmap.py b/src/tensorfold/families/deepseek_v41/cuda/xmap.py
+index d261fe8..4e0f59c 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/xmap.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/xmap.py
+@@ -211,7 +211,8 @@ class XMap:
+                 (_, _, sk, _), _ = X.configs_host(geom)
+             except ValueError:
+                 sk = 0
+-            if int(ex.dims) % 16 or int(ex.width) % 16 or not sk or (int(ex.dims) // 16) % sk:
++            if int(ex.dims) % 16 or int(ex.width) % 16 or not sk or (int(ex.dims) // 16) % sk \
++                    or getattr(ex, "widths", None) is not None:     # TF_DSV41_EXPERT_ROTATE: no byte ranges yet
+                 sk = 0                                      # no prefetch for this shape (records still run)
+             self.layers[id(m)] = Layer(i, ex, geom.experts, int(ex.dims), int(ex.width), sk,
+                                        getattr(m, "gate", None), getattr(m, "bias", None), int(geom.topk))
+diff --git a/tests/cuda/test_dsv41_rotate_gpu.py b/tests/cuda/test_dsv41_rotate_gpu.py
+new file mode 100644
+index 0000000..79aff57
+--- /dev/null
++++ b/tests/cuda/test_dsv41_rotate_gpu.py
+@@ -0,0 +1,94 @@
++# SPDX-License-Identifier: MIT
++"""TF_DSV41_EXPERT_ROTATE on the GPU: a block whose experts differ in width on this rank (``experts.prepare_ragged``,
++``x3ld`` with an expert's own columns / rows) gives every pick's output bit for bit what the same expert gives in a
++block of one width (upstream ``prepare`` + ``x3ld``): the ragged path only changes where an expert's tiles stop.
++
++Run on a Spark: python -m pytest -q tests/cuda/test_dsv41_rotate_gpu.py
++"""
++
++from __future__ import annotations
++
++import pytest
++
++torch = pytest.importorskip("torch")
++if not torch.cuda.is_available():
++    pytest.skip("needs an NVIDIA GPU", allow_module_level=True)
++
++from tensorfold.families.deepseek_v41.cuda import experts as X  # noqa: E402
++from tensorfold.families.deepseek_v41.cuda import expert_loads as loads  # noqa: E402
++
++DEV = "cuda"
++D = 5120
++
++
++def _mat(g, k, n, k2):
++    t = torch.randint(-2 ** 15, 2 ** 15, (k // 16, n // 16, 8 * k2), generator=g, device=DEV,
++                      dtype=torch.int32).to(torch.int16)
++    su = ((torch.rand(k, generator=g, device=DEV) + 0.5) * 0.02).to(torch.float16)
++    sv = (torch.rand(n, generator=g, device=DEV) + 0.5).to(torch.float16)
++    return t, su, sv
++
++
++@pytest.mark.parametrize("k2", [(6, 10), (4, 8), (8, 8)], ids=["3-bit + 5-bit shared", "2-bit + 4", "dspark 4-bit"])
++def test_ragged_picks_equal_one_width_blocks(k2):
++    from tensorfold.cuda.exl3 import experts as x3
++
++    g = torch.Generator(device=DEV).manual_seed(7)
++    E = 16
++    widths = [640 if (e % 4) < 2 else 512 for e in range(E)] + [640]          # routed rotated, shared 640
++    mats = []
++    for e in range(E + 1):
++        kk = k2[0] if e < E else k2[1]
++        mats.append((_mat(g, D, widths[e], kk), _mat(g, D, widths[e], kk), _mat(g, widths[e], D, kk)))
++    rag = X.Experts(X.prepare_ragged([m[0] for m in mats], [m[1] for m in mats], [m[2] for m in mats], "mul1",
++                                     device=DEV), X.Geometry(experts=E, world=4, local=640), keep=[mats])
++    classes = {}
++    for w in (640, 512):
++        ids = [e for e in range(E + 1) if widths[e] == w]
++        lay = X.Experts(x3.prepare([mats[e][0] for e in ids], [mats[e][1] for e in ids], [mats[e][2] for e in ids],
++                                   "mul1", device=DEV), X.Geometry(experts=len(ids) - 1, world=4, local=w),
++                        keep=[mats])
++        classes[w] = (ids, lay)
++    saved = dict(loads.CFG)
++    try:
++        for cfg in loads.CFGS:
++            loads.CFG.update(on=True, gu=cfg, dn=cfg)
++            s = X.scratch(rag, 16)
++            for R in (1, 3, 6, 16):
++                x = torch.randn((R, D), generator=g, device=DEV).to(torch.bfloat16)
++                pick = torch.stack([torch.randperm(E, generator=g, device=DEV)[:6] for _ in range(R)]).to(torch.int32)
++                pick = torch.cat([pick, torch.full((R, 1), E, dtype=torch.int32, device=DEV)], 1).contiguous()
++                got = X.routed(x, pick, None, rag, s, None, R).clone().view(R, 7, D)
++                for w, (ids, lay) in classes.items():
++                    remap = torch.full((E + 1,), -1, dtype=torch.int32)
++                    for j, e in enumerate(ids):
++                        remap[e] = j
++                    pk = remap[pick.cpu().long()].to(DEV)
++                    sc = X.scratch(lay, 16)
++                    want = X.routed(x, pk.contiguous(), None, lay, sc, None, R).view(R, 7, D)
++                    m = (pk >= 0)
++                    assert torch.equal(got[m], want[m]), (cfg, R, w)
++    finally:
++        loads.CFG.clear()
++        loads.CFG.update(saved)
++
++
++def test_ragged_refuses_upstream_kernel():
++    from tensorfold.cuda.exl3 import experts as x3  # noqa: F401
++
++    g = torch.Generator(device=DEV).manual_seed(3)
++    widths = [640, 512, 640]
++    mats = [(_mat(g, D, w, 6), _mat(g, D, w, 6), _mat(g, w, D, 6)) for w in widths]
++    rag = X.Experts(X.prepare_ragged([m[0] for m in mats], [m[1] for m in mats], [m[2] for m in mats], "mul1",
++                                     device=DEV), X.Geometry(experts=2, topk=2, world=4, local=640), keep=[mats])
++    saved = dict(loads.CFG)
++    try:
++        loads.CFG.update(on=False)
++        s = X.scratch(rag, 4)
++        x = torch.randn((1, D), device=DEV).to(torch.bfloat16)
++        pick = torch.tensor([[0, 1, 2]], dtype=torch.int32, device=DEV)
++        with pytest.raises(RuntimeError, match="x3ld"):
++            X.routed(x, pick, None, rag, s, None, 1)
++    finally:
++        loads.CFG.clear()
++        loads.CFG.update(saved)
+diff --git a/tests/test_dsv41_rotate.py b/tests/test_dsv41_rotate.py
+new file mode 100644
+index 0000000..b56f343
+--- /dev/null
++++ b/tests/test_dsv41_rotate.py
+@@ -0,0 +1,125 @@
++# SPDX-License-Identifier: MIT
++"""TF_DSV41_EXPERT_ROTATE (CPU): the uneven TP4 expert split rotated by expert id.
++
++- ``expert_bounds``: for every expert the four ranks' slices partition the width; across any 4 consecutive experts
++  each rank holds the wide (5-block) slice exactly twice; even splits (TP2) are untouched;
++- the loader: a rank's ragged stacks are exactly the rotated slices of the full matrices, the shared expert's wide
++  slices sit on ranks 2 and 3;
++- the forward: four rotated ranks == one rank in exact numerics, and the ranks agree bit for bit.
++"""
++
++from __future__ import annotations
++
++import json
++
++import pytest
++
++torch = pytest.importorskip("torch")
++pytestmark = pytest.mark.torch
++
++import dsv41_fakes as FK  # noqa: E402
++
++from tensorfold.families.deepseek_v41.cuda import engram_host as EH  # noqa: E402
++from tensorfold.families.deepseek_v41.cuda import forward as FW  # noqa: E402
++from tensorfold.families.deepseek_v41.cuda import numerics as N  # noqa: E402
++from tensorfold.families.deepseek_v41.cuda import weights as W  # noqa: E402
++from tensorfold.families.deepseek_v41.cuda.config import Config  # noqa: E402
++from tensorfold.families.deepseek_v41.cuda.csa2.twin import Twin  # noqa: E402
++
++TP4 = dict(num_attention_heads=4, o_groups=4, moe_intermediate_size=640, vocab_size=640)
++IDS = torch.randint(0, 640, (29,), generator=torch.Generator().manual_seed(5)).tolist()
++
++
++def test_rotate_knob(monkeypatch):
++    monkeypatch.delenv(W.ENV_ROTATE, raising=False)
++    assert W.rotate_on() is False
++    monkeypatch.setenv(W.ENV_ROTATE, "1")
++    assert W.rotate_on() is True
++    monkeypatch.setenv(W.ENV_ROTATE, "maybe")
++    with pytest.raises(ValueError):
++        W.rotate_on()
++
++
++def test_expert_bounds_partition_and_rotate():
++    for e in range(12):
++        b = [W.expert_bounds(2304, 4, r, e, True) for r in range(4)]
++        assert sorted(b)[0][0] == 0 and sorted(b)[-1][1] == 2304
++        assert sum(hi - lo for lo, hi in b) == 2304
++        s = sorted(b)
++        assert all(s[i][1] == s[i + 1][0] for i in range(3))
++        wide = {r for r in range(4) if b[r][1] - b[r][0] == 640}
++        assert wide == {e % 4, (e + 1) % 4}
++    for r in range(4):
++        assert sum(W.expert_bounds(2304, 4, r, e, True)[1] - W.expert_bounds(2304, 4, r, e, True)[0] == 640
++                   for e in range(4)) == 2
++    # even splits and rotation off: exactly block_bounds
++    assert [W.expert_bounds(2304, 2, r, 3, True) for r in range(2)] == [W.block_bounds(2304, 2, r) for r in range(2)]
++    assert [W.expert_bounds(2304, 4, r, 3, False) for r in range(4)] == [W.block_bounds(2304, 4, r) for r in range(4)]
++
++
++@pytest.fixture(scope="module")
++def ckpt(tmp_path_factory):
++    root = FK.write_checkpoint(tmp_path_factory.mktemp("dsv41rot"), **TP4)
++    cfg = Config.from_dict(json.loads((root / "config.json").read_text()))
++    return root, cfg, FK.engram_table(cfg)
++
++
++def test_ragged_slices_are_the_rotated_blocks(ckpt):
++    root, cfg, _ = ckpt
++    full = W.Loader(cfg, W.Shards(root), 0, 1).load(2)
++    parts = [W.Loader(cfg, W.Shards(root), r, 4, rotate=True).load(2) for r in range(4)]
++    m0, mp = full.layers[1].moe, [p.layers[1].moe for p in parts]
++    assert all(isinstance(m.w1, W.X3Ragged) for m in mp)
++    for e in range(m0.w1.count):
++        order = sorted(range(4), key=lambda r: W.expert_bounds(640, 4, r, e, True)[0])
++        for name, dim in (("w1", 1), ("w3", 1), ("w2", 0)):
++            joined = torch.cat([getattr(mp[r], name).trellis[e] for r in order], dim)
++            assert torch.equal(joined, getattr(m0, name).trellis[e]), (e, name)
++        assert [mp[r].w1.trellis[e].shape[1] * 16 for r in range(4)] == \
++            [256 if (r - e) % 4 == 0 else 128 for r in range(4)]
++    sh = [p.layers[1].moe.shared[0][0].trellis.shape[1] * 16 for p in parts]
++    assert sh == [128, 128, 256, 128]                     # SHARED_ROT = 2: the 256-wide slice on rank 2
++
++
++def build(ckpt, rank=0, world=1, comm=None, chunk=8):
++    root, cfg, table = ckpt
++    tmap = FK.token_map(cfg)
++    tree = W.Loader(cfg, W.Shards(root), rank, world, rotate=world > 1).load(token_map=tmap)
++    rows = {L: EH.MemoryRows(r, s) for L, (r, s) in table.items()}
++    return FW.Forward(cfg, tree, csa2=Twin(cfg.qk_rope_head_dim, cfg.sliding_window), comm=comm, limit=96,
++                      chunk=chunk, engram_rows=rows, hasher=EH.NgramHasher(cfg, tmap))
++
++
++def run(fw, ids, windows):
++    out, a = [], 0
++    for n in windows:
++        out.append(fw.step(ids[a:a + n]))
++        a += n
++    return torch.cat(out)
++
++
++def tp4(ckpt, fn, **kw):
++    pair = FK.ThreadPair(4)
++    comms = pair.comms()
++    fws = [build(ckpt, r, 4, comms[r], **kw) for r in range(4)]
++    return pair.run([lambda f=f: fn(f) for f in fws])
++
++
++def test_rotated_tp4_equals_one_rank_exact(ckpt):
++    with N.exact():
++        one = run(build(ckpt, chunk=16), IDS, [16, 13])
++        parts = tp4(ckpt, lambda f: run(f, IDS, [16, 13]), chunk=16)
++    every = torch.cat(parts, 1)
++    assert (every - one).abs().max().item() < 1e-10 * max(1.0, one.abs().max().item())
++
++
++def test_rotated_ranks_agree_bit_for_bit(ckpt):
++    def go(f):
++        f.trace = {}
++        run(f, IDS, [8, 8, 8, 5])
++        return {k: v.clone() for k, v in f.trace.items()}
++
++    traces = tp4(ckpt, go)
++    for t in traces[1:]:
++        for L in traces[0]:
++            assert torch.equal(traces[0][L], t[L]), L
