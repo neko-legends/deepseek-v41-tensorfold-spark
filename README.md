@@ -53,6 +53,8 @@ were measured the same way, so the comparison between them holds.
 Median of 3 a cell (the published depth sweep: 512 tokens, greedy, thinking off, trial 0 cold, isolated). Four streams
 at once: **122.2 tok/s** aggregate (`dsbench`, single-stream median 63.8; 2026-10-04: 119.2 / 62.6).
 
+**Where single-user time goes at four ranks** ([spark-bench report](https://github.com/neko-legends/spark-bench/blob/main/artifacts/tensorfold-v41-decode-levers-20261007/REPORT.md)). None of the exact exchange and L2-prefetch switches moved decode beyond boot-to-boot noise. The 4-bit draft head (`TF_DSV41_DRAFT_HEAD=q4`, now in `config/tp4.env.example`) gave +2.5% code and +1.4% prose; the sweep above ran before it. A RoCE trace puts ~2.5 ms of a decode window in ranks waiting for the slowest one. About 0.9 ms of that comes from the uneven expert split (ranks 0 and 1 hold 640 of 2,304 columns, against 512 for ranks 2 and 3).
+
 **Check the transport after every start.** A run-time RoCE failure writes `/cache/roce-failed` in the cache volume, and
 while that file exists every start serves on NCCL; the round-plan link falls back to TCP too. A crash test left one
 behind on 2026-10-05, and our server ran on NCCL for two days without an error. On the same build, NCCL vs RoCE
