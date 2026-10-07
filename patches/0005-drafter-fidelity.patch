@@ -1,0 +1,115 @@
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/dsparkdata.py b/src/tensorfold/families/deepseek_v41/cuda/dsparkdata.py
+index 7a83cf4..93a9535 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/dsparkdata.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/dsparkdata.py
+@@ -44,6 +44,8 @@ class _Sess:
+         self.lab: dict = {}
+         self.drafts: dict = {}
+         self.wins: dict = {}            # start -> (tokens, ids, values) of the slot's last window there
++        self.cands: dict = {}           # start -> (cand [N, C], base [N, C]) of the logged pass (the fidelity check)
++        self.sampled = False            # any pass with keyed noise (T > 0): its drafts are keyed samples
+ 
+ 
+ def _flush(s: _Sess, out: str, K: int, meta: list, min_tokens: int = 8) -> None:
+@@ -62,6 +64,13 @@ def _flush(s: _Sess, out: str, K: int, meta: list, min_tokens: int = 8) -> None:
+     lab_val = np.full((L, K), PAD_VAL, np.float16)
+     has_lab = np.zeros(L, bool)
+     drafts = np.full((L, 5), -1, np.int32)
++    C = max((c.shape[1] for c, _ in s.cands.values()), default=0)
++    lcand = np.full((L, 5, C), -1, np.int32)
++    lbase = np.full((L, 5, C), PAD_VAL, np.float16)
++    for q, (c, b) in s.cands.items():
++        n = min(5, c.shape[0])
++        lcand[q - lo, :n, :c.shape[1]] = c[:n]
++        lbase[q - lo, :n, :c.shape[1]] = np.clip(b[:n], -60000, 60000)
+     for q, t in s.tok.items():
+         tok[q - lo] = t
+     for q, row in s.taps.items():
+@@ -77,7 +86,8 @@ def _flush(s: _Sess, out: str, K: int, meta: list, min_tokens: int = 8) -> None:
+     name = f"s{s.sid:06d}"
+     np.save(os.path.join(out, f"{name}.taps.npy"), taps)
+     np.savez(os.path.join(out, f"{name}.npz"), tok=tok, has_taps=has_taps, lab_ids=lab_ids, lab_val=lab_val,
+-             has_lab=has_lab, drafts=drafts, lo=np.int64(lo))
++             has_lab=has_lab, drafts=drafts, lo=np.int64(lo), lcand=lcand, lbase=lbase,
++             sampled=np.bool_(s.sampled))
+     meta.append({"name": name, "lo": int(lo), "len": int(L), "labels": int(has_lab.sum()),
+                  "taps": int(has_taps.sum())})
+ 
+@@ -112,6 +122,9 @@ def build(out: str, logs: list[str], K: int = 32) -> dict:
+                 elif kind == "d":
+                     s.tok[ev["start"]] = int(ev["pending"])
+                     s.drafts[ev["start"]] = [int(x) for x in ev["drafts"]]
++                    s.sampled = s.sampled or bool(ev.get("noise"))
++                    if "cand" in ev:
++                        s.cands[ev["start"]] = (np.asarray(ev["cand"], np.int32), np.asarray(ev["base"], np.float32))
+                 elif kind == "w":
+                     for g in ev["segs"]:
+                         ss = open_s.get(g["slot"])
+@@ -195,7 +208,9 @@ class Data:
+                 "serial": np.stack([z["tok"][Ps + 1 + i] for i in range(n)], 1).astype(np.int64),
+                 "lab_ids": np.stack([z["lab_ids"][Ps + 1 + i] for i in range(n)], 1).astype(np.int64),
+                 "lab_val": np.stack([z["lab_val"][Ps + 1 + i] for i in range(n)], 1).astype(np.float32),
+-                "drafts": z["drafts"][Ps].astype(np.int64)}
++                "drafts": z["drafts"][Ps].astype(np.int64), "sampled": bool(z.get("sampled", False)),
++                **({"lcand": z["lcand"][Ps].astype(np.int64), "lbase": z["lbase"][Ps].astype(np.float32)}
++                   if "lcand" in z and z["lcand"].shape[-1] else {})}
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/dsparktrain.py b/src/tensorfold/families/deepseek_v41/cuda/dsparktrain.py
+index 22a24ac..9b9455b 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/dsparktrain.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/dsparktrain.py
+@@ -356,6 +356,9 @@ def evaluate(model: Drafter, data, sessions, *, seg: int = 96, max_segments: int
+     tf = np.zeros(n)
+     reach, kept = np.zeros(n), np.zeros(n)
+     lens, agree, agree1, agree_n, rows = [], 0, 0, 0, 0
++    # fidelity on greedy sessions only (a sampled pass's drafts are keyed samples, not the argmax chain), over the
++    # pass's LOGGED candidate ids (the engine's per-rank top-K union), so only the port's numerics can differ
++    g_all, g_first, g_n, g_pos, b_top, b_err, b_n = 0, 0, 0, np.zeros(n), 0, 0.0, 0
+     segs = data.segments(sessions, seg)
+     if max_segments:
+         segs = segs[:max_segments]
+@@ -392,11 +395,41 @@ def evaluate(model: Drafter, data, sessions, *, seg: int = 96, max_segments: int
+         agree1 += int((lg[m, 0] == dn[m, 0]).sum())
+         agree_n += int(m.sum())
+         rows += B
++        if "lcand" in bt and not bt.get("sampled", False):
++            lc, lb = bt["lcand"].to(model.dev), bt["lbase"].to(model.dev)            # [B, n, C]
++            ok = (lc[:, :, 0] >= 0).all(1) & torch.from_numpy(m).to(model.dev)
++            if bool(ok.any()):
++                lc, lb, bo = lc[ok], lb[ok], base[ok]
++                valid = lc >= 0
++                pb = bo.gather(-1, lc.clamp(min=0))                                  # the port's base, same ids
++                b_err += float(((pb - lb).abs() * valid).sum() / valid.sum().clamp(min=1)) * int(ok.sum())
++                b_top += int((pb.masked_fill(~valid, -1e30).argmax(-1) == lb.masked_fill(~valid, -1e30).argmax(-1))
++                             .all(1).sum())
++                prev = bt["anchor"].to(model.dev)[ok]
++                dd = []
++                for i in range(n):
++                    zc = pb[:, i] + torch.einsum("br,bcr->bc", model.me(prev), w2p[lc[:, i].clamp(min=0)])
++                    zc = zc.masked_fill(~valid[:, i], -1e30)
++                    tok = lc[:, i].gather(-1, zc.argmax(-1, keepdim=True)).squeeze(-1)
++                    dd.append(tok)
++                    prev = tok
++                dd = torch.stack(dd, 1).cpu().numpy()
++                lgg = lg[ok.cpu().numpy()]
++                eqg = (dd == lgg) | (lgg < 0)
++                g_all += int(eqg.all(1).sum())
++                g_first += int(eqg[:, 0].sum())
++                g_pos += eqg.sum(0)
++                g_n += int(ok.sum())
++                b_n += int(ok.sum())
+     return {"rows": rows, "teacher_forced_top1": (tf / max(rows, 1)).round(4).tolist(),
+             "conditional": (kept / np.maximum(reach, 1)).round(4).tolist(),
+             "tokens_per_round_all5": round(1 + float(np.mean(lens)), 4) if lens else None,
+             "agree_logged_drafts": round(agree / agree_n, 4) if agree_n else None,
+-            "agree_logged_first": round(agree1 / agree_n, 4) if agree_n else None, "logged_passes": agree_n}
++            "agree_logged_first": round(agree1 / agree_n, 4) if agree_n else None, "logged_passes": agree_n,
++            "greedy_agree_on_logged_cands": round(g_all / g_n, 4) if g_n else None,
++            "greedy_agree_by_position": (g_pos / max(g_n, 1)).round(4).tolist() if g_n else None,
++            "greedy_passes": g_n, "base_argmax_all_rows_equal": round(b_top / b_n, 4) if b_n else None,
++            "base_abs_err_mean": round(b_err / b_n, 4) if b_n else None}
+ 
+ 
+ def train(model: Drafter, data, sessions, *, minutes: float, lr: float, seg: int = 96, gamma: float = 0.8,
