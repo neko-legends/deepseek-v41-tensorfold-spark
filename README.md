@@ -19,6 +19,20 @@ Weights: [`dealignai/DeepSeek-V4.1-Flash-UNCENSORED-EXL3-2.9bpw`](https://huggin
 Configuration: [`config/prod.env.example`](config/prod.env.example) + [`config/tp4.env.example`](config/tp4.env.example)
 (expert pruning on, `TF_DSV41_EXPERT_TOPP=0.85`), thinking off, temperature 0, 512-token replies, isolated runs.
 
+### At a glance (live, 2026-10-07)
+
+| | four Sparks (this fork) | two Sparks (Jay's) |
+| --- | ---: | ---: |
+| one user, short code prompt (`m2bench`, tok/s) | **122-124** | ~80 |
+| one user, short prose prompt (`m2bench`, tok/s) | **68-69** | ~41-45 |
+| four users at once, steady (`m2bench` C4, tok/s) | **~200** | |
+| code / prose, 1k-160k prompts (geometric mean, tok/s) | **104 / 67** | |
+| cold 160k-token prompt | **36 s** | |
+
+Live build: Jay's G19 engine with `0003` (four Sparks), `0004` (rotated expert split, `TF_DSV41_EXPERT_ROTATE=1`) and
+the 4-bit draft head (`TF_DSV41_DRAFT_HEAD=q4`), on RoCE; every reply exact (drafted == serial). Two-Spark figures are
+Jay's published `m2bench` C1 numbers for his build.
+
 ### G19 on four Sparks (2026-10-07)
 
 Jay's G19 engine (engine `7bd2d67`) with this fork's `0003`, live since 2026-10-07, against the G13 build it replaced,
