@@ -87,7 +87,14 @@ build log      /home/jun/tf4/build-rot-lp1.log (on forge; `applying /src/patches
 image on       forge, anvil, ember, flame -- the same id sha256:6c9dd4f5a713... on all four
 checks         `python -m pytest tests/test_dsv41_logprobs.py` inside the built image: 13 passed (17.8 s)
                `from tensorfold.families.deepseek_v41.cuda import logprobs` resolves inside the image
-live world     untouched: dsv41-tf4-r0..r3 still `dsv41-tensorfold:tp4rot`, `Up 23 hours`, /health ok
+               (the image labels 1dc556b, the patch commit; the branch head 0aab0c2 changes docs only)
+live world     NOT untouched, by this worker's mistake: at 17:57 a cleanup loop
+               (``docker ps --format '{{.Names}}' | grep -v tensorfol | xargs docker kill``) matched the live
+               container's *name* (dsv41-tf4-r0 does not contain "tensorfol") and killed rank 0 on forge; the
+               keeper's health checks failed at 17:58/18:00/18:02 and it restarted the four ranks (18:02:01 stop,
+               18:03:41 ready, 94 s). The world came back on the same image tag, args, env and mounts
+               (TF_DSV41_IMAGE_ID sha256:b8f261..., 4 x 420064 tokens, NVMe tier 3627 entries) -- verified against
+               the pre-incident `docker inspect`; only the RAM session cache was lost.
 ```
 
 ## 3. Rollout (NOT executed -- Depths coordinates the restart window with Jun/Eva)
