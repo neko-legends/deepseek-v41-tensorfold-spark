@@ -78,8 +78,17 @@ done; wait
 `scripts/serve4.sh prebuild` was **not** run: this patch adds no CUDA/Triton kernel, and prebuild puts a container on
 the GPUs (the live server must keep them).
 
-Evidence of the build (label, id, on which nodes): see `docs/LOGPROBS-ROLLOUT.md` §6 and
-`/home/jun/tf4/build-rot-lp1.log` on forge.
+Evidence of the build (2026-10-08, run exactly as above on forge):
+
+```
+tf_src_commit 1dc556babf6eda82aa99e6580409b518f552552b     (this branch's commit)
+docker image id sha256:6c9dd4f5a713864101eb801fee01418c7131d968c619ac631ea0717b7f02df87
+build log      /home/jun/tf4/build-rot-lp1.log (on forge; `applying /src/patches/0001..0006` in order)
+image on       forge, anvil, ember, flame -- the same id sha256:6c9dd4f5a713... on all four
+checks         `python -m pytest tests/test_dsv41_logprobs.py` inside the built image: 13 passed (17.8 s)
+               `from tensorfold.families.deepseek_v41.cuda import logprobs` resolves inside the image
+live world     untouched: dsv41-tf4-r0..r3 still `dsv41-tensorfold:tp4rot`, `Up 23 hours`, /health ok
+```
 
 ## 3. Rollout (NOT executed -- Depths coordinates the restart window with Jun/Eva)
 
@@ -135,12 +144,15 @@ Notes for the window:
   gave**: `tensorfold.token_ids`' sha256 `03467e9a2d1ac0e5` (recorded 2026-10-08 on `tp4rot`; the reply was
   `"2, 3, 5, 7, 11, 13"`), and it carries no `logprobs` object.
 
-Before this rollout every check has a recorded baseline on `tp4rot` (same script, same host):
+Before this rollout every check has a recorded baseline on `tp4rot` (the shipped script, run 2026-10-08 from
+eva-core; exit 1):
 
 ```
+== verify-logprobs: http://forge:8000/v1/chat/completions ==
 [A] FAIL: no choices[0].logprobs (keys ['finish_reason', 'index', 'message']) -- the server dropped the request's logprobs=True
-[B] FAIL: BackendCapabilityError: forge:8000 (model 'DeepSeek-V4.1-Flash-TF') returned no `logprobs` for '__probe__' ...
+[B] FAIL: BackendCapabilityError: forge:8000 (model 'DeepSeek-V4.1-Flash-TF') returned no `logprobs` for '__probe__' for a logprobs=true request (top_logprobs=20): ...
 [C] PASS: greedy reply unchanged (03467e9a2d1ac0e5): '2, 3, 5, 7, 11, 13'
+== verify-logprobs: FAILED ==
 ```
 
 ## 5. The exact container parameters to reproduce (from `docker inspect`, 2026-10-08)
