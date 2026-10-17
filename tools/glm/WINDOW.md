@@ -17,7 +17,7 @@ file outside the repo (`GLMW_ENV`: hosts, RoCE address/netdev/HCA, paths). Every
 subcommands; reference answers were recorded before the window (`tools/glm/ref_tokens.py record`, the Phase-2 engine
 serving), so the window needs no reference engine.
 
-Common env for every step: `B=$HOME/glm53-tf/bin-0eb6952f  W=$HOME/glm53-tf/runs/$(date +%m%d-%H%M)`.
+Common env for every step: `B=$HOME/glm53-tf/bin-8f174273  W=$HOME/glm53-tf/runs/$(date +%m%d-%H%M)`.
 
 ## 0. Before (2 min)
 - `free -g` on each Spark after DeepSeek is down: expect >= 100 GiB available; `nvidia-smi` shows no process.
