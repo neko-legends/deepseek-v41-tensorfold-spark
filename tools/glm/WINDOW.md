@@ -5,7 +5,7 @@ runs outside a window. Hosts are named spark1..spark4 (rank 0..3, rank order of 
 RoCE link address, `$MODEL` = `$HOME/models/GLM-5.3-Flash-FP4-Local` (fanned out and sha256-verified on all four).
 
 Binaries (aarch64, sm_121, CUDA 13.0.88 nvcc, stripped), staged and sha256-checked on every Spark:
-`$HOME/glm53-tf/bin-8f174273/{tensorfold-native,tf-cuda-test}` (`SHA256SUMS` beside them; built from branch
+`$HOME/glm53-tf/bin-a83582d1/{tensorfold-native,tf-cuda-test}` (`SHA256SUMS` beside them; built from branch
 glm53-tensorfold-20261017 at 8f174273: the FP4-Local loader, the server API parity, structured output, the CUDA
 image tower; `bin-9f41dec8` is the same without vision, `bin-0eb6952f` the loader alone). Libraries in `$HOME/glm53-tf/lib/` (`SHA256SUMS`): `libnccl.so.2` (NCCL 2.32.3,
 the Nemotron runs' copy; upstream's GLM ranks dlopen it) and `libtfgrammar.so` (structured output, found as
@@ -17,7 +17,7 @@ file outside the repo (`GLMW_ENV`: hosts, RoCE address/netdev/HCA, paths). Every
 subcommands; reference answers were recorded before the window (`tools/glm/ref_tokens.py record`, the Phase-2 engine
 serving), so the window needs no reference engine.
 
-Common env for every step: `B=$HOME/glm53-tf/bin-8f174273  W=$HOME/glm53-tf/runs/$(date +%m%d-%H%M)`.
+Common env for every step: `B=$HOME/glm53-tf/bin-a83582d1  W=$HOME/glm53-tf/runs/$(date +%m%d-%H%M)`.
 
 ## 0. Before (2 min)
 - `free -g` on each Spark after DeepSeek is down: expect >= 100 GiB available; `nvidia-smi` shows no process.
@@ -90,3 +90,12 @@ reply must equal the `"draft": false` reply; note acceptance per round.
 ## Stop / restore
 Stop the servers (SIGTERM, then check `nvidia-smi` is empty on all four), hand back to the orchestrator for DeepSeek.
 Copy `$W` logs to the mission folder. Nothing in this agenda writes outside `$HOME/glm53-tf/`.
+
+## First window results (2026-10-17, 05:50-06:36, bin-a83582d1)
+- Thin TP-1 (TF_GLM_LAYERS=8): load 68.4 s, 27.58 GiB. HF per-layer gate layers 0-7: cos 0.999989-0.999998.
+- TP-4 (NCCL over RoCE, 45 layers): load ~233 s, 47.37 GiB/rank (51.16 on rank 0 with --vision and MTP).
+  Greedy tokens vs the reference: 5/7 equal, 2 near ties (the same two the reference ties with itself), MTP on or off.
+- MTP: drafted == plain on 3/3; 36-59 tok/s (accept 59-89%) vs 25 tok/s without drafts.
+- Prefill 8,423 tokens 4.41 s (1,910 t/s), 31,948 tokens 17.30 s (1,847 t/s). Prompt cache under TP: cached 8,192.
+- verify.py 7/7 on our server (structured output with drafts needed Backend.held, fixed in the window).
+- glm-vision 224: processor 2.4e-7, 24 blocks >= 0.999995, tail 0.999987 (PASS); TP-4 image answer correct.
