@@ -216,6 +216,7 @@ pub const Engine = struct {
 
     /// Frees slot `slot`'s sequence (slot 0 stays: the first stream's, made at init) and binds slot 0.
     pub fn release(e: *Engine, slot: u32) void {
+        if (e.images) |im| if (im.slot == slot) im.clear(); // ours: a cancelled image pass's rows go with its stream
         if (slot != 0) e.free(slot);
         e.cur = e.seqs.items[0].?;
         e.slot = 0;
