@@ -5,9 +5,9 @@ runs outside a window. Hosts are named spark1..spark4 (rank 0..3, rank order of 
 RoCE link address, `$MODEL` = `$HOME/models/GLM-5.3-Flash-FP4-Local` (fanned out and sha256-verified on all four).
 
 Binaries (aarch64, sm_121, CUDA 13.0.88 nvcc, stripped), staged and sha256-checked on every Spark:
-`$HOME/glm53-tf/bin-9f41dec8/{tensorfold-native,tf-cuda-test}` (`SHA256SUMS` beside them; built from branch
-glm53-tensorfold-20261017 at 9f41dec8: the FP4-Local loader, the server API parity, structured output; the older
-`bin-0eb6952f` is the loader alone). Libraries in `$HOME/glm53-tf/lib/` (`SHA256SUMS`): `libnccl.so.2` (NCCL 2.32.3,
+`$HOME/glm53-tf/bin-e81ca0ea/{tensorfold-native,tf-cuda-test}` (`SHA256SUMS` beside them; built from branch
+glm53-tensorfold-20261017 at e81ca0ea: the FP4-Local loader, the server API parity, structured output, the CUDA
+image tower; `bin-9f41dec8` is the same without vision, `bin-0eb6952f` the loader alone). Libraries in `$HOME/glm53-tf/lib/` (`SHA256SUMS`): `libnccl.so.2` (NCCL 2.32.3,
 the Nemotron runs' copy; upstream's GLM ranks dlopen it) and `libtfgrammar.so` (structured output, found as
 `../lib` beside the binary's folder). A CPU reference venv (torch 2.14.1+cpu, transformers 5.20.1) with
 `tools/glm` and B12X's `_csf_blocks.py` lives on spark2 under `$HOME/glm53-tf/{refenv,tools,b12x}`.
@@ -68,6 +68,14 @@ TP-4 top-1 tokens / logprobs with the Phase-2 vLLM engine on the same prompts in
 ## 5. MTP (all four, ~5 min)
 Same as 4 without `--no-drafts` (on CUDA the MTP head loads exactly when drafts are on; `TF_GLM_MTP` is the Python engine's): loads the W4A16 MTP experts as stored; a drafted greedy
 reply must equal the `"draft": false` reply; note acceptance per round.
+
+## 5b. CUDA vision (spark1, ~5 min, then TP-4 with `GLMW_VISION=1`)
+- `glmw.sh vision $HOME/glm53-tf/vision-ref/224-all $HOME/glm53-tf/vision-ref/img224.png`: the processor's patches vs
+  HF's, the patch embedding, each of the 24 blocks from the reference's own input (gate cos >= 0.999), the tail
+  (post norm, downsample, merger; >= 0.999), and the end-to-end rows (reported only: the reference's late blocks
+  hinge on near ties between "sink" patches, bf16 vs fp32 rows 0.9916). Then the 640 dump (only blocks 0/11/23).
+- TP-4 with `--vision`: the orchestrator's verify.py image line ("red square, blue circle"), an image prompt twice
+  (prompt cache keyed by the image hash).
 
 ## 6. Server API on our TP-4 server (~5 min)
 - `tools/glm/ref_tokens.py compare http://RANK0:8190 ref-tokens.json`: greedy tokens vs the reference's (near ties

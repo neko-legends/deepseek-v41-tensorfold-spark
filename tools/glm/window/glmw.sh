@@ -8,6 +8,7 @@
 # Subcommands (each prints what it ran; logs go to $GLMW_RUNS/<stamp>/ on the hosts):
 #   pre                         memory, GPU processes, binaries' and libraries' sha256 on every host
 #   glmref                      upstream's synthetic kernel gate on rank 0's GPU (tf-cuda-test glm-ref)
+#   vision REF [IMG]            the CUDA image tower stage by stage vs tools/glm/vision_ref.py's dumps in REF (host 0)
 #   thin LAYERS [dump]          one rank (TF_GLM_WORLD=1) on host 0 with LAYERS layers, --no-drafts; dump: TF_GLM_DUMP
 #   tp [drafts] [CONTEXT]       all four ranks over NCCL (RoCE), 45 layers; drafts: MTP on
 #   wait                        until rank 0 lists the model (prints the load time)
@@ -37,6 +38,7 @@ start_rank() { # host rank world layers dump drafts context
   [ "$w" -gt 1 ] && env+=" NCCL_COMM_ID=$GLMW_MASTER:29660 $NCCL_ENV"
   local flags="--host 0.0.0.0 --port $PORT --no-update-check --context $ctx --parallel 1 --name GLM-5.3-Flash-FP4"
   [ "$drafts" = drafts ] || flags+=" --no-drafts"
+  [ -n "${GLMW_VISION:-}" ] && flags+=" --vision"  # GLMW_VISION=1: the image tower on rank 0
   say "$h rank $r/$w: $env tensorfold-native serve MODEL $flags"
   on "$h" "mkdir -p ~/$d/dump && cd ~/$d && date +%s.%N > r$r.start && \
     env $env setsid nohup $GLMW_BIN/tensorfold-native serve $GLMW_MODEL $flags > r$r.log 2>&1 < /dev/null & echo started"
@@ -51,6 +53,8 @@ pre)
   done ;;
 glmref)
   d=$(run_dir); on "${H[0]}" "mkdir -p ~/$d && cd ~/$d && LD_LIBRARY_PATH=$GLMW_LIB $GLMW_BIN/tf-cuda-test glm-ref 2>&1 | tee glm-ref.log | tail -20" ;;
+vision)
+  d=$(run_dir); on "${H[0]}" "mkdir -p ~/$d && cd ~/$d && LD_LIBRARY_PATH=$GLMW_LIB $GLMW_BIN/tf-cuda-test glm-vision $GLMW_MODEL ${2:?ref dir} ${3:-} 2>&1 | tee glm-vision.log | tail -40" ;;
 thin)
   start_rank "${H[0]}" 0 1 "${2:?layers}" "${3:-}" nodrafts "${GLMW_CONTEXT:-4096}" ;;
 tp)
