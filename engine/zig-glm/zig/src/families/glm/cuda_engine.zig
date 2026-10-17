@@ -31,8 +31,13 @@ pub const prompt_rows = fw.prefill_rows;
 pub const shared_rows = 32;
 pub const max_shared = 8;
 
-/// One stream's window of a shared verify: its slot, its ids, and its drawn tokens.
-pub const Part = struct { slot: u32, ids: []const u32, out: []u32 };
+/// One stream's window of a shared verify: its slot, its ids, its drawn tokens, and (rank 0, ours) its rows'
+/// structured-output bits (u32 [rows][words], empty: none).
+pub const Part = struct { slot: u32, ids: []const u32, out: []u32, masks: []const u32 = &.{} };
+
+/// Ours: a step's draws under structured output. `on`: every rank gathers the whole rows (no greedy all-gather) and
+/// rank 0 draws among `bits` (u32 [rows][words]; the other ranks have none and draw nothing).
+pub const Masked = struct { on: bool = false, bits: []const u32 = &.{} };
 
 /// A kept prompt state as the prompt cache holds it: the id every rank keeps its own copy under, and its position.
 pub const Kept = struct { id: u64, at: u32 };
@@ -86,6 +91,8 @@ pub const Engine = struct {
     next_snap: u64 = 1, // rank 0: the next id
     announce: u64 = 0, // rank 0: a state kept at this chunk's mark, for the other ranks to copy at its gate
     dropped: std.ArrayList(u32) = .empty, // rank 0: ids dropped since the other ranks last heard (cuda_follow)
+    masked: Masked = .{}, // ours: the current step's structured-output draws (draw)
+    rows_host: []u16 = &.{}, // ours: rank 0's gathered bf16 rows for a masked greedy pick, made at the first
 
     /// Opens rank `rank` of `world` over `comm`; the ranks agree on settings (cuda_ranks) before the weights load.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, checkpoint: []const u8, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize, o: Options) !*Engine {
@@ -162,6 +169,7 @@ pub const Engine = struct {
         while (it.next()) |s| e.freeSnap(s);
         e.snaps.deinit(e.gpa);
         e.dropped.deinit(e.gpa);
+        e.gpa.free(e.rows_host);
         e.shared_buf.free();
         e.smp.deinit();
         e.pairs.free();
@@ -390,19 +398,33 @@ pub const Engine = struct {
         }
     };
 
-    /// A verify window: `ids` (pending token, then drafts) at the committed position; `out[r]` drawn at pos + 1 + r.
-    pub fn verify(e: *Engine, ids: []const u32, out: []u32) !void {
+    /// A verify window: `ids` (pending token, then drafts) at the committed position; `out[r]` drawn at pos + 1 + r,
+    /// among `masked`'s allowed tokens when it is on (ours).
+    pub fn verify(e: *Engine, ids: []const u32, out: []u32, masked: Masked) !void {
         if (ids.len == 0 or ids.len > fw.window_rows) return error.WindowTooWide;
         var one: [1]fw.Rank = undefined;
         const f = e.view(&e.bd, &one);
         const at = e.cur.st.pos;
         try f.run(@ptrCast(ids));
         e.cur.rows_at = e.bd.fnormed;
+        e.masked = masked;
+        defer e.masked = .{};
         try e.draw(e.bd.logits, ids.len, at + 1, out);
     }
 
+    /// Ours: the prompt's first token drawn again from its last row (the prompt pass's draw is unmasked), among
+    /// `masked`'s allowed tokens; the prompt buffers still hold that row (Backend.first_masked follows the pass).
+    pub fn redrawFirst(e: *Engine, len: usize, masked: Masked) !u32 {
+        if (len == 0 or len != e.cur.st.pos) return error.PositionMismatch; // the pass committed the prompt
+        e.masked = masked;
+        defer e.masked = .{};
+        var t: [1]u32 = undefined;
+        try e.draw(e.bp.logits, 1, len, &t);
+        return t[0];
+    }
+
     /// Several streams' windows in one forward: shared row ops, per-part attention and KDA.
-    pub fn verifyShared(e: *Engine, parts: []const Part) !void {
+    pub fn verifyShared(e: *Engine, parts: []const Part, masked: bool) !void {
         const b = if (e.bs) |*x| x else return error.NoSharedWindows;
         if (parts.len == 0 or parts.len > max_shared) return error.WindowTooWide;
         var segs: [max_shared]fw.Seg = undefined;
@@ -419,9 +441,11 @@ pub const Engine = struct {
         var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..parts.len] }};
         const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .kda_wide = e.settings.kda_wide };
         try f.run(@ptrCast(ids[0..rows]));
+        defer e.masked = .{};
         for (parts, segs[0..parts.len]) |p, g| {
             try e.bind(p.slot);
             e.cur.rows_at = b.fnormed + g.row0 * e.c.hidden * 2;
+            e.masked = .{ .on = masked, .bits = p.masks };
             try e.draw(b.logits + g.row0 * e.share.vocab.len() * 2, g.rows, g.st.pos + 1, p.out);
         }
     }
@@ -462,8 +486,22 @@ pub const Engine = struct {
 
     /// `rows` logits rows of this rank's vocabulary -> the tokens at positions first, first + 1, ...
     fn draw(e: *Engine, logits: u64, rows: usize, first: u64, out: []u32) !void {
+        if (e.masked.on) return e.drawMasked(logits, rows, first, out);
         if (e.cur.sampling) |s| return e.smp.draw(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = logits }}, rows, first, sampler.rule(s), out);
         for (0..rows) |r| out[r] = try e.greedy(logits + r * e.share.vocab.len() * 2);
+    }
+
+    /// Ours, structured output: every rank's columns gathered on every rank, then rank 0 draws among its bits (sampled
+    /// on the device, greedy on the host: largest allowed value, lowest id); the other ranks' `out` is zeros (unread).
+    fn drawMasked(e: *Engine, logits: u64, rows: usize, first: u64, out: []u32) !void {
+        try e.smp.gather(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = logits }}, rows);
+        if (e.share.rank != 0) {
+            try e.stream.synchronize();
+            @memset(out[0..rows], 0);
+            return;
+        }
+        if (e.cur.sampling == null and e.rows_host.len == 0) e.rows_host = try e.gpa.alloc(u16, e.smp.rows * e.c.vocab);
+        try e.smp.masked(e.stream, rows, first, if (e.cur.sampling) |s| sampler.rule(s) else null, e.masked.bits, e.rows_host, out);
     }
 
     /// decode.sample_rows' greedy pick: per-rank top-1 (tf_glm_top1), all-gathered, largest value then lowest id.

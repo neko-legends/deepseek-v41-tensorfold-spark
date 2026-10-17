@@ -49,6 +49,7 @@ pub const Lanes = struct {
         .keep = keepFn,
         .draft = draftFn,
         .release = releaseFn,
+        .first_masked = firstMaskedFn,
     };
     const steps_vt: be.Backend.VTable = vt: {
         var v = whole_vt;
@@ -185,6 +186,15 @@ pub const Lanes = struct {
         return self.next - 1;
     }
 
+    /// Ours, structured output: the first token among `mask`'s allowed ones, drawn again from the prompt's last row.
+    fn firstMaskedFn(ptr: *anyopaque, s: *lanes.Stream, position: u64, mask: []const u32) anyerror!u64 {
+        const self = of(ptr);
+        if (position != s.prompt_len) return error.PositionMismatch;
+        const l = self.lanes.getPtr(s) orelse return error.UnknownStream;
+        try self.x.bind(l.slot);
+        return self.take(try self.x.redraw(@intCast(position), mask));
+    }
+
     fn queueFn(ptr: *anyopaque, s: *lanes.Stream, feed: be.Feed, position: u64) anyerror!u64 {
         _ = ptr;
         _ = s;
@@ -216,7 +226,7 @@ pub const Lanes = struct {
             const drafts = if (w.held > 0) l.held[0..w.held] else w.tokens;
             @memcpy(ids[1..][0..drafts.len], drafts);
             var sampled: [max_rows]u32 = undefined;
-            try self.x.verify(ids[0..rows], sampled[0..rows]);
+            try self.x.verify(ids[0..rows], sampled[0..rows], w.masks);
             @memcpy(o.sampled[0..rows], sampled[0..rows]);
             @memcpy(o.drafts[0..drafts.len], drafts);
             l.pending_rows = rows;
@@ -241,7 +251,7 @@ pub const Lanes = struct {
             ids[k][0] = w.pending;
             const drafts = if (w.held > 0) l.held[0..w.held] else w.tokens;
             @memcpy(ids[k][1..][0..drafts.len], drafts);
-            parts[k] = .{ .slot = l.slot, .ids = ids[k][0..rows], .out = sampled[k][0..rows] };
+            parts[k] = .{ .slot = l.slot, .ids = ids[k][0..rows], .out = sampled[k][0..rows], .masks = w.masks };
             lane[k] = l;
         }
         try self.x.verifyShared(parts[0..windows.len]);

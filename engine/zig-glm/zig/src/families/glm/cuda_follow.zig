@@ -6,15 +6,18 @@ const engine = @import("cuda_engine.zig");
 const sampler = @import("cuda_sampler.zig");
 const Engine = engine.Engine;
 
-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared };
+pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, redraw };
+
+/// Ours: verify and shared steps whose draws are structured output (Engine.Masked: every rank gathers the rows).
+pub const masked_flag: u32 = 2;
 
 /// One step as it crosses: 64 bytes, then `n` u32 ids.
 pub const Header = extern struct {
     kind: u32,
     n: u32 = 0, // ids that follow
     depth: u32 = 0, // draft: drafts to chain; chunk: where it starts; shared: its parts
-    flags: u32 = 0, // begin: sampled; draft: from the prompt
-    a: u64 = 0, // keep: rows; prefill, chunk: the kept state it resumes (0: none)
+    flags: u32 = 0, // begin: sampled; draft: from the prompt; verify, shared: masked_flag
+    a: u64 = 0, // keep: rows; prefill, chunk: the kept state it resumes (0: none); redraw: the prompt's length
     seed: u64 = 0, // begin: the sampling seed; prefill, chunk: the kept state's position
     temperature: f64 = 0,
     top_p: f64 = 0,
@@ -169,10 +172,19 @@ pub const Leader = struct {
         return x.e.prefillChunk(part, start, ids.len, from, cancel, marks);
     }
 
-    pub fn verify(x: Leader, ids: []const u32, out: []u32) !void {
+    /// `masks` (ours): the window's rows' structured-output bits (empty: none).
+    pub fn verify(x: Leader, ids: []const u32, out: []u32, masks: []const u32) !void {
         try x.flush();
-        try x.send(.{ .kind = @backingInt(Kind.verify) }, ids);
-        try x.e.verify(ids, out);
+        const on = masks.len > 0;
+        try x.send(.{ .kind = @backingInt(Kind.verify), .flags = if (on) masked_flag else 0 }, ids);
+        try x.e.verify(ids, out, .{ .on = on, .bits = masks });
+    }
+
+    /// Ours: the prompt's first token drawn again among `mask`'s allowed tokens, on every rank (Engine.redrawFirst).
+    pub fn redraw(x: Leader, len: usize, mask: []const u32) !u32 {
+        try x.flush();
+        try x.send(.{ .kind = @backingInt(Kind.redraw), .a = len }, &.{});
+        return x.e.redrawFirst(len, .{ .on = true, .bits = mask });
     }
 
     /// Several streams' windows in one forward on every rank (Engine.verifyShared): parts' slots and rows, then ids.
@@ -188,8 +200,10 @@ pub const Leader = struct {
             @memcpy(buf[n..][0..p.ids.len], p.ids);
             n += p.ids.len;
         }
-        try x.send(.{ .kind = @backingInt(Kind.shared), .depth = @intCast(parts.len) }, buf[0..n]);
-        try x.e.verifyShared(parts);
+        var on = false;
+        for (parts) |p| on = on or p.masks.len > 0;
+        try x.send(.{ .kind = @backingInt(Kind.shared), .depth = @intCast(parts.len), .flags = if (on) masked_flag else 0 }, buf[0..n]);
+        try x.e.verifyShared(parts, on);
     }
 
     pub fn keep(x: Leader, n: usize) !void {
@@ -239,7 +253,8 @@ pub fn follow(e: *Engine, link: *Link) !void {
                     else => return err,
                 };
             },
-            .verify => try e.verify(step.ids, sampled[0..step.ids.len]),
+            .verify => try e.verify(step.ids, sampled[0..step.ids.len], .{ .on = h.flags & masked_flag != 0 }),
+            .redraw => _ = try e.redrawFirst(@intCast(h.a), .{ .on = true }),
             .shared => {
                 const k = h.depth;
                 if (k == 0 or k > engine.max_shared or step.ids.len < 2 * k) return error.BadStep;
@@ -254,7 +269,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
                     at += n;
                     row += n;
                 }
-                try e.verifyShared(parts[0..k]);
+                try e.verifyShared(parts[0..k], h.flags & masked_flag != 0);
             },
             .keep => try e.keep(@intCast(h.a)),
             .draft => {
