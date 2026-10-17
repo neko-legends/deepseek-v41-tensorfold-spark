@@ -85,7 +85,10 @@ pub fn weightShare(a: std.mem.Allocator, io: std.Io, dir: []const u8, total: u64
     const text = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 24)) catch return total;
     const c = config.parse(a, text) catch return total;
     const f = (shard.Share.of(&c, p.rank, p.world) catch return total).part(&c);
-    return @intCast(@as(u128, total) * f[0] / f[1]);
+    const share: u64 = @intCast(@as(u128, total) * f[0] / f[1]);
+    // ours: TF_GLM_LAYERS=N loads N of the layers (a thin load): about that share of the routed experts' bytes
+    const n = if (std.c.getenv("TF_GLM_LAYERS")) |v| std.fmt.parseInt(u64, std.mem.span(v), 10) catch 0 else 0;
+    return if (n > 0 and n < c.layers) share * (n + 1) / c.layers else share;
 }
 
 /// Slots for `context` plus a verify window, a multiple of 64 so the sparse pool keeps the AOT set.
