@@ -105,3 +105,42 @@ Load on one rank (`TF_GLM_LAYERS=N`), `tf-cuda-test glm-ref`, the per-layer HF g
 MTP acceptance. Then: native FP8 matmuls (fp8g exists upstream for 128x128 blocks; MXFP8 needs a UE8M0 kernel),
 RoCE collectives (`fabric/tp`) in place of NCCL, CUDA vision, csf decode of only the rank's rows (load time),
 our server API bits.
+
+## Stage B (CPU, before the first GPU window)
+
+**Server API vs the reference engine** (vLLM, `--reasoning-parser glm45 --tool-call-parser glm47`, the Phase-2 template
+with its thinking switch). Upstream's server already renders GLM's template, parses GLM-4.7 calls and streams usage;
+ours on top:
+- thinking switch = vLLM's GLM-4.7 / DeepSeek-V3 parser rule: on when `enable_thinking` or `thinking` is on, off when
+  either is given (not null) and neither is (`fields.thinkingFields`); off renders `<think></think>`.
+- `TENSORFOLD_REASONING_FIELDS=reasoning_content|reasoning|both`: `both` (our DeepSeek server's default; the GLM
+  launch sets it) emits vLLM's `reasoning` beside our harnesses' `reasoning_content`, in messages and stream deltas;
+  the upstream default stays `reasoning_content` (the frozen goldens: 309/319, 0 unexpected). An earlier reply's
+  `reasoning` reaches the template as `reasoning_content`; /v1/messages and /v1/responses read either name.
+- `tools/glm/api_parity.py` (the real server on `fake_serve`, the checkpoint's tokenizer + template, against the
+  reference): 16/16 prompts token-identical (thinking combos, efforts, system, history, tool specs, tool turns),
+  5/5 replies parsed identically (plain, thinking, one call, two calls, thinking + call; streamed and whole; usage
+  chunk). Known differences, kept: an effort the template does not name is coerced to the nearest (medium -> High;
+  the reference passes it and the template falls back to Max); the reference drops a history `reasoning_content`
+  (it reads only `reasoning`), ours renders it as the template intends (clear_thinking false); a literal
+  `</arg_value>` inside a value ends it here (vLLM's glm47 reads it as data unless a key or the call's end follows).
+
+**Structured output on the CUDA engine** (JSON schema, required tool calls; upstream's GLM backend had no masked
+draw): `first_masked` and window masks; a masked step gathers every rank's logits columns on every rank (the
+sampled draw's broadcast; `masked_flag` on verify/shared steps, a `redraw` step for the first token), rank 0
+applies the grammar bits (sample.cu's `tf_grammar_mask`) and draws (sampled on the device; greedy on the host,
+largest allowed value, lowest id on ties).
+
+**CUDA vision** (`cuda_vision.zig`; plan and HF line references in the stage-B notes): HF Glm5NextVisionModel in
+bf16 on rank 0 (weights bf16 at load: MXFP8 exact, W4A16 NVFP4 as code x scale x scale_2 rounded once; new vit.cu
+kernels for the RMSNorms, q/k norm + axial 2-D rope, clamped SwiGLU, the 4096-wide LayerNorm, the splice;
+`vision_kernel<64,8>`), image rows broadcast to every rank and spliced over the `<|image|>` rows in all four hc
+copies (and the MTP head's embedding); `--vision` (default 8000 image tokens, the processor's maximum). The
+processor is upstream's Metal-side code, split into `vision_config.zig` / `image_patches.zig` so both share it;
+its geometry equals Glm5NextProcessor's on 15 sizes (a test). `tools/glm/vision_ref.py` is the HF CPU reference;
+`tf-cuda-test glm-vision MODEL REF [IMG]` gates the tower block by block (the reference's own bf16 vs fp32 runs
+agree only to cos 0.99 on the final rows: late "sink" patches hinge on near ties, so the end-to-end number is
+reported, not gated). Rank 0 holds ~1.1 GiB of tower weights + ~1.3 GiB scratch at 8000 tokens.
+Known gaps: `--vision` / image tokens are not in the ranks' fingerprint (every rank must be started alike); video
+(upstream's video.zig frame groups) is not wired on CUDA; an image prompt passes whole (no other stream's round
+between its chunks).
