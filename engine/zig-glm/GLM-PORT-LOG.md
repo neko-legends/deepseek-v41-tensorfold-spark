@@ -144,3 +144,21 @@ reported, not gated). Rank 0 holds ~1.1 GiB of tower weights + ~1.3 GiB scratch 
 Known gaps: `--vision` / image tokens are not in the ranks' fingerprint (every rank must be started alike); video
 (upstream's video.zig frame groups) is not wired on CUDA; an image prompt passes whole (no other stream's round
 between its chunks).
+
+## Same-harness bench vs the vLLM engine (2026-10-17, second window)
+
+TP-4 over NCCL on the RoCE rail, binary a83582d1, MTP drafts on, `--vision`, `--parallel 4`, `--context 320000`
+(load 237 s). The bench was the spark-bench qbench (all areas), the cold prefill ladder and the vision cells: the same
+inputs and scoring as the vLLM b12x row (spark-bench branch `glm53-fp4-20261017`, `results/glm53-fp4-tf-20261017/`).
+
+| | vLLM b12x | this engine |
+|---|---:|---:|
+| MMLU-200 / GSM8K / coding / IF | 88.0 / 100 / 80 / 90 % | 88.0 / 100 / 80 / 95 % (195/200 MMLU replies identical) |
+| JSON / tools / passkey to 229K / summary invented | 100 / 100 / 100 % / 4.2 % | 100 / 100 / 100 % / 0 % |
+| vision text 166 / shapes 30 / counts 23 | 166 / 28 / 0 | 166 / 28 / 0 |
+| code / prose 1 stream, 4-stream aggregate (tok/s) | 82.0 / 36.5, 81.2 | 58.7 / 36.8, 61.6 |
+| TTFT short | 0.25 s | 0.14-0.17 s |
+| cold prefill 32K / 131K / 200K | 12.3 / 50.8 / 79.4 s | 18.4 / 75.5 / 120.3 s |
+
+Quality: at parity. Speed: behind on code decode, on 4 streams and on prefill (~1.5x). Next: native FP8 GEMMs for the
+MXFP8 / FP8_PB_WO layers (no widening to bf16), and our RoCE collectives (fabric/tp) in place of NCCL.
