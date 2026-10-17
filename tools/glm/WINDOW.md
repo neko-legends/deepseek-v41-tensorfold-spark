@@ -5,8 +5,8 @@ runs outside a window. Hosts are named spark1..spark4 (rank 0..3, rank order of 
 RoCE link address, `$MODEL` = `$HOME/models/GLM-5.3-Flash-FP4-Local` (fanned out and sha256-verified on all four).
 
 Binaries (aarch64, sm_121, CUDA 13.0.88 nvcc, stripped), staged and sha256-checked on every Spark:
-`$HOME/glm53-tf/bin-6bdf8bd9/{tensorfold-native,tf-cuda-test}` (`SHA256SUMS` beside them; built from branch
-glm53-tensorfold-20261017 at 6bdf8bd9: the FP4-Local loader, the server API parity, structured output, the CUDA
+`$HOME/glm53-tf/bin-8f174273/{tensorfold-native,tf-cuda-test}` (`SHA256SUMS` beside them; built from branch
+glm53-tensorfold-20261017 at 8f174273: the FP4-Local loader, the server API parity, structured output, the CUDA
 image tower; `bin-9f41dec8` is the same without vision, `bin-0eb6952f` the loader alone). Libraries in `$HOME/glm53-tf/lib/` (`SHA256SUMS`): `libnccl.so.2` (NCCL 2.32.3,
 the Nemotron runs' copy; upstream's GLM ranks dlopen it) and `libtfgrammar.so` (structured output, found as
 `../lib` beside the binary's folder). A CPU reference venv (torch 2.14.1+cpu, transformers 5.20.1) with
