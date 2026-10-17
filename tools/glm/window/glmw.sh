@@ -10,7 +10,7 @@
 #   glmref                      upstream's synthetic kernel gate on rank 0's GPU (tf-cuda-test glm-ref)
 #   vision REF [IMG]            the CUDA image tower stage by stage vs tools/glm/vision_ref.py's dumps in REF (host 0)
 #   thin LAYERS [dump]          one rank (TF_GLM_WORLD=1) on host 0 with LAYERS layers, --no-drafts; dump: TF_GLM_DUMP
-#   tp [drafts] [CONTEXT]       all four ranks over NCCL (RoCE), 45 layers; drafts: MTP on
+#   tp [drafts] [CONTEXT]       all four ranks over NCCL (RoCE), 45 layers; drafts: MTP on; GLMW_PARALLEL=N streams (default 1)
 #   wait                        until rank 0 lists the model (prints the load time)
 #   gate ROWS LAYERS            the last thin run's dump to GLMW_REF, then tools/glm/layer_ref.py there
 #   stop                        SIGTERM every tensorfold-native, then check no GPU process is left
@@ -36,7 +36,7 @@ start_rank() { # host rank world layers dump drafts context
   [ "$layers" != 0 ] && env+=" TF_GLM_LAYERS=$layers"
   [ "$dump" = dump ] && env+=" TF_GLM_DUMP=\$HOME/$d/dump"
   [ "$w" -gt 1 ] && env+=" NCCL_COMM_ID=$GLMW_MASTER:29660 $NCCL_ENV"
-  local flags="--host 0.0.0.0 --port $PORT --no-update-check --context $ctx --parallel 1 --name GLM-5.3-Flash-FP4"
+  local flags="--host 0.0.0.0 --port $PORT --no-update-check --context $ctx --parallel ${GLMW_PARALLEL:-1} --name GLM-5.3-Flash-FP4"
   [ "$drafts" = drafts ] || flags+=" --no-drafts"
   [ -n "${GLMW_VISION:-}" ] && flags+=" --vision"  # GLMW_VISION=1: the image tower on rank 0
   say "$h rank $r/$w: $env tensorfold-native serve MODEL $flags"
