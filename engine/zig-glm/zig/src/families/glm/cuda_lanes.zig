@@ -51,6 +51,7 @@ pub const Lanes = struct {
         .draft = draftFn,
         .release = releaseFn,
         .first_masked = firstMaskedFn,
+        .held = heldFn,
     };
     const steps_vt: be.Backend.VTable = vt: {
         var v = whole_vt;
@@ -206,6 +207,14 @@ pub const Lanes = struct {
         const self = of(ptr);
         if (position != s.prompt_len) return error.PositionMismatch;
         return self.next - 1;
+    }
+
+    /// Ours, structured output with drafts: the drafts the head left for the stream's next window, as host tokens.
+    fn heldFn(ptr: *anyopaque, s: *lanes.Stream, out: []u32) anyerror!void {
+        const self = of(ptr);
+        const l = self.lanes.getPtr(s) orelse return error.UnknownStream;
+        if (out.len > l.held_n) return error.NoHeldDrafts;
+        @memcpy(out, l.held[0..out.len]);
     }
 
     /// Ours, structured output: the first token among `mask`'s allowed ones, drawn again from the prompt's last row.
