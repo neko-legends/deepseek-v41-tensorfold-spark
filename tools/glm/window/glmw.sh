@@ -59,12 +59,14 @@ thin)
   start_rank "${H[0]}" 0 1 "${2:?layers}" "${3:-}" nodrafts "${GLMW_CONTEXT:-4096}" ;;
 tp)
   drafts=${2:-nodrafts}; ctx=${3:-32768}
-  for r in 3 2 1 0; do start_rank "${H[$r]}" "$r" 4 0 "" "$drafts" "$ctx"; sleep 2; done ;;
+  # rank 0 first (its NCCL_COMM_ID root listens), the others at once; each ssh in the background (a rank's start may
+  # hold its ssh session until it exits)
+  for r in 0 1 2 3; do start_rank "${H[$r]}" "$r" 4 0 "" "$drafts" "$ctx" & sleep 3; done; sleep 5 ;;
 wait)
   d=$(run_dir); t0=$(date +%s)
   for _ in $(seq 1 360); do
     if curl -s -m 5 "http://${H[0]}:$PORT/v1/models" | grep -q GLM-5.3-Flash-FP4; then say "rank 0 serving after $(( $(date +%s) - t0 )) s of waiting"; exit 0; fi
-    on "${H[0]}" "pgrep -f 'tensorfold-native serve' >/dev/null" || { say "rank 0 exited"; on "${H[0]}" "tail -30 ~/$d/r0.log"; exit 1; }
+    on "${H[0]}" "pgrep -f '[t]ensorfold-native serve' >/dev/null" || { say "rank 0 exited"; on "${H[0]}" "tail -30 ~/$d/r0.log"; exit 1; }
     sleep 10
   done; say "not serving after 3600 s"; exit 1 ;;
 gate)
@@ -72,16 +74,16 @@ gate)
   on "${H[0]}" "cd ~/$d && tar cf - dump" | on "$GLMW_REF" "mkdir -p ~/$d && cd ~/$d && tar xf -"
   on "$GLMW_REF" "cd ~/$d && $GLMW_VENV/bin/python -I $GLMW_TOOLS/layer_ref.py $GLMW_MODEL dump --rows $rows --layers $layers --b12x $GLMW_B12X 2>&1 | tee gate-$layers.log" ;;
 stop)
-  for h in "${H[@]}"; do on "$h" "pkill -TERM -f 'tensorfold-native serve' ; true"; done
+  for h in "${H[@]}"; do on "$h" "pkill -TERM -f '[t]ensorfold-native serve' ; true"; done
   sleep 5
   for h in "${H[@]}"; do
-    for _ in $(seq 1 30); do on "$h" "pgrep -f 'tensorfold-native serve' >/dev/null" || break; sleep 2; done
-    on "$h" "pkill -KILL -f 'tensorfold-native serve'; echo \$(hostname): left \$(pgrep -fc 'tensorfold-native serve'); nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader"
+    for _ in $(seq 1 30); do on "$h" "pgrep -f '[t]ensorfold-native serve' >/dev/null" || break; sleep 2; done
+    on "$h" "pkill -KILL -f '[t]ensorfold-native serve'; echo \$(hostname): left \$(pgrep -fc '[t]ensorfold-native serve'); nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader"
   done ;;
 status)
   d=$(run_dir)
   for r in "${!H[@]}"; do
-    on "${H[$r]}" "echo \$(hostname) r$r: \$(pgrep -fc 'tensorfold-native serve') proc, avail \$(awk '/MemAvailable/{print int(\$2/1048576)}' /proc/meminfo) GiB; \
+    on "${H[$r]}" "echo \$(hostname) r$r: \$(pgrep -fc '[t]ensorfold-native serve') proc, avail \$(awk '/MemAvailable/{print int(\$2/1048576)}' /proc/meminfo) GiB; \
       nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader; tail -${TAIL:-5} ~/$d/r$r.log 2>/dev/null"
   done ;;
 *) sed -n 2,20p "$0"; exit 2 ;;
