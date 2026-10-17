@@ -32,6 +32,10 @@ pub const CompactAt = union(enum) { auto, fraction: f64 };
 
 pub const Identity = @import("identity.zig").Identity;
 
+/// ``reasoning_content`` (this server's and the Python server's), ``reasoning`` (vLLM's) or both (our DeepSeek
+/// server's default, and what our GLM-5.3-Flash launch sets: harnesses read the first, vLLM clients the second).
+pub const ReasoningFields = enum { reasoning_content, reasoning, both };
+
 pub const Config = struct {
     served_name: []const u8,
     model_dir: []const u8 = "",
@@ -53,6 +57,8 @@ pub const Config = struct {
     seed_salt: i64 = 0,
     /// TENSORFOLD_REQUEST_LOG: where chat and completion bodies are appended; null: nowhere.
     request_log: ?[]const u8 = null,
+    /// TENSORFOLD_REASONING_FIELDS (ours): the name(s) a chat reply's reasoning goes under (chat.reasoningDelta).
+    reasoning_fields: ReasoningFields = .reasoning_content,
     /// Null keeps every reply identical to a server that has no compaction.
     compact_at: ?CompactAt = null,
     /// Tokens of the recent tail kept whole. Null uses min(20000, a quarter of the window).

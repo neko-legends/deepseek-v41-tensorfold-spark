@@ -111,6 +111,11 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         std.debug.print("tensorfold: TENSORFOLD_SEED_SALT={s}: an integer\n", .{t});
         return 1;
     } else 0;
+    const fields_env = env(s, "TENSORFOLD_REASONING_FIELDS");
+    const reasoning_fields: server_mod.ReasoningFields = if (fields_env) |t| std.meta.stringToEnum(server_mod.ReasoningFields, std.mem.trim(u8, t, " ")) orelse {
+        std.debug.print("tensorfold: TENSORFOLD_REASONING_FIELDS={s}: reasoning_content, reasoning or both\n", .{t});
+        return 1;
+    } else .reasoning_content;
     const config: server_mod.Config = .{
         .served_name = s.served,
         .model_dir = s.model_dir,
@@ -126,6 +131,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .vision_urls = args.vision_urls,
         .seed_salt = salt,
         .request_log = env(s, "TENSORFOLD_REQUEST_LOG"),
+        .reasoning_fields = reasoning_fields,
         .dashboard = args.dashboard,
         .compact_at = if (args.compact_auto) .{ .auto = {} } else if (args.compact_fraction) |f| .{ .fraction = f } else null,
         .compact_keep = args.compact_keep,

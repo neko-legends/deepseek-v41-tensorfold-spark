@@ -469,7 +469,7 @@ const Reply = struct {
         const choice = data.get("choices").?.array[0];
         const message = choice.get("message") orelse Value.null;
         const d = try r.obj();
-        try r.put(d, "reasoning_content", message.get("reasoning_content") orelse .null);
+        try r.put(d, "reasoning_content", message.get("reasoning_content") orelse message.get("reasoning") orelse .null); // ours: either name
         try r.put(d, "content", message.get("content") orelse .null);
         var calls: std.ArrayList(Value) = .empty;
         if (message.get("tool_calls")) |tc| if (tc == .array) for (tc.array, 0..) |call, i| {

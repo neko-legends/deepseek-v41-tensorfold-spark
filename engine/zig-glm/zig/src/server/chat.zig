@@ -320,7 +320,7 @@ const Generation = struct {
             const piece = g.streamed_reasoning.after(split.reasoning, true);
             if (piece.len > 0) {
                 try g.streamed_reasoning.set(g.a, split.reasoning, piece);
-                try g.emit(sink, try deltaOf(g.a, "reasoning_content", piece));
+                try g.emit(sink, try reasoningDelta(g.a, g.srv.config.reasoning_fields, piece));
             }
             answer = split.answer;
         }
@@ -426,7 +426,7 @@ const Generation = struct {
         if (g.sink) |sink| {
             const thought = g.streamed_reasoning.text.items;
             if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
-                try g.emit(sink, try deltaOf(a, "reasoning_content", r[thought.len..]));
+                try g.emit(sink, try reasoningDelta(a, g.srv.config.reasoning_fields, r[thought.len..]));
             const shown = if (g.calls != null) try reply_text.finishedProse(a, content) else content;
             const sent = g.streamed.text.items;
             const rest = if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) shown[sent.len..] else "";
@@ -526,9 +526,31 @@ fn decodeText(t: anytype, a: Allocator, tokens: []const u32) ![]u8 {
     return t.decode(a, tokens);
 }
 
+/// A reply's reasoning delta under the server's name(s) (ours): ``reasoning_content``, which our harnesses and this
+/// server's own routes read, ``reasoning`` (vLLM's, the GLM-5.3-Flash reference engine's), or both.
+pub fn reasoningDelta(a: Allocator, names: @import("server.zig").ReasoningFields, text: []const u8) Allocator.Error!Value {
+    const o = try json.newObject(a);
+    if (names != .reasoning) try o.put(a, "reasoning_content", .{ .string = text });
+    if (names != .reasoning_content) try o.put(a, "reasoning", .{ .string = text });
+    return .{ .object = o };
+}
+
 /// ``{key: text}``: a streamed delta (role, content or reasoning_content).
 pub fn deltaOf(a: Allocator, key: []const u8, text: []const u8) Allocator.Error!Value {
     const o = try json.newObject(a);
     try o.put(a, key, .{ .string = text });
     return .{ .object = o };
+}
+
+test "a reasoning delta goes under the server's name(s): reasoning_content, reasoning, or both" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const both = try reasoningDelta(a, .both, "hm");
+    try std.testing.expectEqualStrings("hm", both.get("reasoning_content").?.string);
+    try std.testing.expectEqualStrings("hm", both.get("reasoning").?.string);
+    const ours = try reasoningDelta(a, .reasoning_content, "hm");
+    try std.testing.expect(ours.get("reasoning") == null and ours.get("reasoning_content") != null);
+    const vllm = try reasoningDelta(a, .reasoning, "hm");
+    try std.testing.expect(vllm.get("reasoning_content") == null and vllm.get("reasoning") != null);
 }

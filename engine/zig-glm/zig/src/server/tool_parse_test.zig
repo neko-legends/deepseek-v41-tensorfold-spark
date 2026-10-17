@@ -470,3 +470,25 @@ test "GLM pairs from the cached key and value ends are the pairs each key's own 
     }
     try std.testing.expect(compared > 1000);
 }
+
+test "GLM-4.7 calls as vLLM's glm47 parser reads them: values verbatim, newlines between pairs, no arguments" {
+    // (vLLM's glm47 also reads a literal </arg_value> inside a value as data unless the next key or the call's end
+    // follows it; this parser ends the value at the first one: a known difference, see engine/zig-glm/GLM-PORT-LOG.md)
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"write\",\"parameters\":{\"properties\":{\"text\":{\"type\":\"string\"},\"n\":{\"type\":\"integer\"}}}}}]")).ok.array;
+    const cases = [_][2][]const u8{
+        .{ "<tool_call>write<arg_key>text</arg_key><arg_value>a</arg_value>\n<arg_key>n</arg_key><arg_value>2</arg_value>\n</tool_call>", "{\"text\":\"a\",\"n\":2}" },
+        .{ "<tool_call>write<arg_key>text</arg_key><arg_value> spaced </arg_value></tool_call>", "{\"text\":\" spaced \"}" },
+        .{ "<tool_call>write<arg_key> n </arg_key><arg_value>3</arg_value></tool_call>", "{\"n\":3}" },
+        .{ "<tool_call>write</tool_call>", "{}" },
+    };
+    for (cases) |c| {
+        const r = try parse(a, c[0], tools, null);
+        std.testing.expectEqualStrings(c[1], r.calls.?[0].get("function").?.get("arguments").?.string) catch |e| {
+            std.debug.print("case {s}\n", .{c[0]});
+            return e;
+        };
+    }
+}

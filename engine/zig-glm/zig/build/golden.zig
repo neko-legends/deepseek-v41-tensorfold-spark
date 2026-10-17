@@ -24,5 +24,7 @@ pub fn step(b: *std.Build, target: std.Build.ResolvedTarget, server: *std.Build.
     golden_run.addDirectoryArg(b.path("zig/tests/server/golden"));
     golden_run.addDirectoryArg(b.path("zig/tests/server/fixtures"));
     golden_run.setCwd(b.path("."));
+    // ours: fake_serve installed alone (tools/glm/api_parity.py serves a real tokenizer and chat template on it)
+    b.step("fake-serve", "fake_serve (the scripted engine behind the real server) into zig-out/bin").dependOn(&b.addInstallArtifact(fake_serve, .{}).step);
     b.step("test-golden", "The frozen server parity goldens checked by a Zig step driving fake_serve").dependOn(&golden_run.step);
 }

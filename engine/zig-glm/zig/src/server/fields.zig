@@ -193,6 +193,22 @@ fn thinkingSwitch(v: ?Value) ?bool {
     return null;
 }
 
+/// The kwargs' thinking switch as vLLM's GLM-4.7 and DeepSeek-V3 parsers read it (ours, for GLM-5.3-Flash): on when
+/// ``enable_thinking`` or ``thinking`` is on, off when either is given (not null) and neither is; null: neither given.
+fn switchOf(kwargs: Value) ?Value {
+    var given = false;
+    var on = false;
+    if (kwargs.get("enable_thinking")) |v| if (v != .null) {
+        given = true;
+        on = on or v.truthy();
+    };
+    if (thinkingSwitch(kwargs.get("thinking"))) |sw| {
+        given = true;
+        on = on or sw;
+    }
+    return if (given) .{ .bool = on } else null;
+}
+
 pub const Thinking = struct { effort: ?[]const u8 = null, enable: ?bool = null };
 
 /// ``thinking_fields``: a request's effort and thinking switch where it sets them.
@@ -201,11 +217,7 @@ pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8) errors.R
     const raw = body.get("chat_template_kwargs");
     const kwargs: ?Value = if (raw != null and raw.?.truthy()) raw.? else null;
     const kw_object = kwargs == null or kwargs.? == .object;
-    var enable: ?Value = if (kwargs) |k| k.get("enable_thinking") else null;
-    const has_enable = kwargs != null and kwargs.?.has("enable_thinking");
-    if (kw_object and !has_enable) if (thinkingSwitch(if (kwargs) |k| k.get("thinking") else null)) |sw| {
-        enable = .{ .bool = sw };
-    };
+    const enable: ?Value = if (kw_object) if (kwargs) |k| switchOf(k) else null else null;
     var effort = body.field("reasoning_effort");
     if (effort == null and kw_object) if (kwargs) |k| {
         effort = k.field("reasoning_effort");
@@ -336,4 +348,36 @@ test "efforts and numbers" {
     defer arena.deinit();
     try std.testing.expectEqualStrings("-12", (try pyIntText(arena.allocator(), " -0_12 ")).?);
     try std.testing.expect(try pyIntText(arena.allocator(), "8.0") == null);
+}
+
+test "the thinking switch: off iff enable_thinking or thinking is given and neither is on (vLLM's GLM-4.7 parser)" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cx: Cx = .{ .a = a };
+    const cases = [_]struct { []const u8, ?bool }{
+        .{ "{}", null },
+        .{ "{\"chat_template_kwargs\": {}}", null },
+        .{ "{\"chat_template_kwargs\": {\"enable_thinking\": false}}", false },
+        .{ "{\"chat_template_kwargs\": {\"enable_thinking\": true}}", true },
+        .{ "{\"chat_template_kwargs\": {\"thinking\": false}}", false },
+        .{ "{\"chat_template_kwargs\": {\"thinking\": true}}", true },
+        .{ "{\"chat_template_kwargs\": {\"enable_thinking\": false, \"thinking\": true}}", true },
+        .{ "{\"chat_template_kwargs\": {\"enable_thinking\": true, \"thinking\": false}}", true },
+        .{ "{\"chat_template_kwargs\": {\"enable_thinking\": false, \"thinking\": false}}", false },
+        .{ "{\"chat_template_kwargs\": {\"enable_thinking\": null}}", null },
+        .{ "{\"chat_template_kwargs\": {\"enable_thinking\": null, \"thinking\": false}}", false },
+        .{ "{\"chat_template_kwargs\": {\"thinking\": {\"type\": \"disabled\"}}}", false },
+        .{ "{\"chat_template_kwargs\": {\"thinking\": {\"type\": \"enabled\"}, \"enable_thinking\": false}}", true },
+        .{ "{\"reasoning_effort\": \"none\"}", false },
+        .{ "{\"reasoning_effort\": \"none\", \"chat_template_kwargs\": {\"thinking\": true}}", true },
+    };
+    for (cases) |c| {
+        const body = (try json.parseText(a, c[0])).ok;
+        const got = (try thinkingFields(&cx, body, &.{})).enable;
+        std.testing.expectEqual(c[1], got) catch |e| {
+            std.debug.print("case {s}\n", .{c[0]});
+            return e;
+        };
+    }
 }

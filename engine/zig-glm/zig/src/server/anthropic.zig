@@ -269,7 +269,7 @@ const Reply = struct {
             };
             if (r.stop_sequence != .null) r.finish = "stop_sequence";
             const delta = choice.get("delta") orelse Value.null;
-            try r.text("thinking", json.strOr(delta.get("reasoning_content")));
+            try r.text("thinking", json.strOr(delta.get("reasoning_content") orelse delta.get("reasoning"))); // ours: either name
             try r.text("text", json.strOr(delta.get("content")));
             if (delta.get("tool_calls")) |tc| if (tc == .array) for (tc.array) |call| {
                 const at: i64 = if (call.get("index")) |i| i.int64() orelse 0 else 0;
@@ -336,7 +336,7 @@ const Reply = struct {
         const choice = data.get("choices").?.array[0];
         const message = choice.get("message").?;
         var content: std.ArrayList(Value) = .empty;
-        if (message.get("reasoning_content")) |t| if (t.truthy()) {
+        if (message.get("reasoning_content") orelse message.get("reasoning")) |t| if (t.truthy()) { // ours: either name
             const b = try json.newObject(a);
             try b.put(a, "type", .{ .string = "thinking" });
             try b.put(a, "thinking", t);

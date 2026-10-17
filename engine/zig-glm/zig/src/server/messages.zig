@@ -126,6 +126,10 @@ pub fn normalizeWith(cx: *Cx, messages: ?Value, late_system: []const u8, needs_u
             return cx.refuse("message content must be text or an array of text parts");
         }
         const r = role.?.string;
+        // ours: an earlier reply's reasoning under vLLM's name (``reasoning``) reaches the template as reasoning_content
+        if (std.mem.eql(u8, r, "assistant") and item.get("reasoning_content") == null) if (item.get("reasoning")) |t| if (t == .string) {
+            item = try withField(cx, item, "reasoning_content", t);
+        };
         if (std.mem.eql(u8, r, "system") or std.mem.eql(u8, r, "developer")) {
             if (out.items.len == 0) {
                 try instructions.append(cx.a, item);
@@ -294,4 +298,16 @@ test "a conversation keeps its shape when the template does not need the rule" {
     try std.testing.expectEqual(@as(usize, 2), out.array.len);
     try std.testing.expectEqualStrings("assistant", out.array[0].get("role").?.string);
     try std.testing.expectEqualStrings("tool", out.array[1].get("role").?.string);
+}
+
+test "an earlier reply's reasoning under vLLM's name reaches the template as reasoning_content" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cx: Cx = .{ .a = a };
+    const parsed = (try json.parseText(a, "[{\"role\":\"user\",\"content\":\"q\"},{\"role\":\"assistant\",\"content\":\"a\",\"reasoning\":\"r\"},{\"role\":\"assistant\",\"content\":\"b\",\"reasoning\":\"x\",\"reasoning_content\":\"kept\"}]")).ok;
+    const out = try normalize(&cx, parsed, "system", false);
+    try std.testing.expectEqualStrings("r", out.array[1].get("reasoning_content").?.string);
+    try std.testing.expectEqualStrings("kept", out.array[2].get("reasoning_content").?.string);
+    try std.testing.expect(out.array[0].get("reasoning_content") == null);
 }
