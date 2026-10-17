@@ -268,7 +268,9 @@ fn renderCalls(r: *R, calls: []const Value) Error!void {
         const f = c.get("function");
         const fnv = if (f != null and f.? != .null) f.? else c;
         if (fnv != .object) return r.refuse("a tool call's function must be an object", .{});
-        const name = try qualifiedName(r.a, fnv, fnv.get("namespace")) orelse return r.refuse("a tool call has no name", .{});
+        // encoding.py reads the call's own ``namespace`` first, then the function's
+        const call_ns = if (c.get("namespace")) |n| (if (n.truthy()) n else null) else null;
+        const name = try qualifiedName(r.a, fnv, call_ns orelse fnv.get("namespace")) orelse return r.refuse("a tool call has no name", .{});
         try r.put("<" ++ DSML ++ " invoke name=\"");
         try r.put(name);
         try r.put("\">\n");
@@ -374,6 +376,12 @@ fn messagesOf(r: *R, messages: Value, o: Options) Error![]Msg {
     return merged.items;
 }
 
+fn onlyToolResults(m: Msg) bool {
+    if (m.blocks.items.len == 0) return false;
+    for (m.blocks.items) |b| if (!b.tool) return false;
+    return true;
+}
+
 /// The prompt text for ``messages`` (a JSON array of OpenAI messages); error.Refused sets ``problem``.
 pub fn render(a: Allocator, messages: Value, o: Options, problem: *Problem) Error![]u8 {
     var r: R = .{ .a = a, .problem = problem };
@@ -382,6 +390,8 @@ pub fn render(a: Allocator, messages: Value, o: Options, problem: *Problem) Erro
     const drop = o.drop_thinking and !(msgs.len > 0 and msgs[0].tools);
     var last: ?usize = null; // the last user turn (or a system message after the first)
     for (msgs, 0..) |m, idx| if (m.role == .user or (m.role == .system and idx > 0)) {
+        // a user turn of tool results alone starts no new turn (encoding.py ``find_last_user_index``)
+        if (m.role == .user and onlyToolResults(m)) continue;
         last = idx;
     };
     const thinking = o.thinking;
@@ -476,4 +486,20 @@ test "a thinking conversation with a tool call and an out-of-order result" {
     try std.testing.expectEqual(@as(?u8, 75), budgetOf(.{ .string = "medium" }));
     try std.testing.expectEqual(@as(?u8, null), budgetOf(.{ .string = "none" }));
     try std.testing.expectEqual(@as(?u8, null), budgetOf(.{ .int = "101" }));
+}
+
+test "1017's encoding: a tool-result turn starts no new turn, and a call's own namespace qualifies it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const x = arena.allocator();
+    const msgs = (try json.parseText(x,
+        \\[{"role":"user","content":"hi"},
+        \\ {"role":"assistant","content":"","reasoning":"plan","tool_calls":[
+        \\   {"id":"a","type":"function","namespace":"search","function":{"name":"lookup","arguments":"{}"}}]},
+        \\ {"role":"tool","tool_call_id":"a","content":"A"}]
+    )).ok;
+    var problem: Problem = .{};
+    const got = try render(x, msgs, .{ .budget = 75 }, &problem); // no tools declared: drop_thinking stays on
+    try std.testing.expect(std.mem.indexOf(u8, got, ASSISTANT ++ THINK_OPEN ++ "plan</think>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "invoke name=\"search::lookup\"") != null);
 }
