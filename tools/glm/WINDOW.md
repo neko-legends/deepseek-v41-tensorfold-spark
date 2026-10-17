@@ -5,9 +5,17 @@ runs outside a window. Hosts are named spark1..spark4 (rank 0..3, rank order of 
 RoCE link address, `$MODEL` = `$HOME/models/GLM-5.3-Flash-FP4-Local` (fanned out and sha256-verified on all four).
 
 Binaries (aarch64, sm_121, CUDA 13.0.88 nvcc, stripped), staged and sha256-checked on every Spark:
-`$HOME/glm53-tf/bin-0eb6952f/{tensorfold-native,tf-cuda-test}` (`SHA256SUMS` beside them; built from branch
-glm53-tensorfold-20261017 at 0eb6952f). NCCL: upstream's GLM ranks dlopen `libnccl.so.2`; copy the one the Nemotron
-runs use into `$HOME/glm53-tf/lib/` and set `LD_LIBRARY_PATH=$HOME/glm53-tf/lib`.
+`$HOME/glm53-tf/bin-9f41dec8/{tensorfold-native,tf-cuda-test}` (`SHA256SUMS` beside them; built from branch
+glm53-tensorfold-20261017 at 9f41dec8: the FP4-Local loader, the server API parity, structured output; the older
+`bin-0eb6952f` is the loader alone). Libraries in `$HOME/glm53-tf/lib/` (`SHA256SUMS`): `libnccl.so.2` (NCCL 2.32.3,
+the Nemotron runs' copy; upstream's GLM ranks dlopen it) and `libtfgrammar.so` (structured output, found as
+`../lib` beside the binary's folder). A CPU reference venv (torch 2.14.1+cpu, transformers 5.20.1) with
+`tools/glm` and B12X's `_csf_blocks.py` lives on spark2 under `$HOME/glm53-tf/{refenv,tools,b12x}`.
+
+Driver: `tools/glm/window/glmw.sh` (subcommands pre, glmref, thin, tp, wait, gate, stop, status), configured by a
+file outside the repo (`GLMW_ENV`: hosts, RoCE address/netdev/HCA, paths). Every step below is one or two of its
+subcommands; reference answers were recorded before the window (`tools/glm/ref_tokens.py record`, the Phase-2 engine
+serving), so the window needs no reference engine.
 
 Common env for every step: `B=$HOME/glm53-tf/bin-0eb6952f  W=$HOME/glm53-tf/runs/$(date +%m%d-%H%M)`.
 
@@ -60,6 +68,16 @@ TP-4 top-1 tokens / logprobs with the Phase-2 vLLM engine on the same prompts in
 ## 5. MTP (all four, ~5 min)
 Same as 4 without `--no-drafts` (on CUDA the MTP head loads exactly when drafts are on; `TF_GLM_MTP` is the Python engine's): loads the W4A16 MTP experts as stored; a drafted greedy
 reply must equal the `"draft": false` reply; note acceptance per round.
+
+## 6. Server API on our TP-4 server (~5 min)
+- `tools/glm/ref_tokens.py compare http://RANK0:8190 ref-tokens.json`: greedy tokens vs the reference's (near ties
+  within 0.5 nats reported apart).
+- The orchestrator's `verify.py http://RANK0:8190/v1`: thinking default/off, stream, JSON schema (structured output:
+  first_masked + masked windows), tools with and without thinking (the image line fails until CUDA vision).
+- `tools/glm/api_parity.py` ran before the window on `fake_serve` (template, parsers, stream framing): only the engine
+  is new here.
+- Prompt cache under TP: the same long prompt twice (`usage.prompt_tokens_details.cached_tokens` > 0 the second
+  time, the same reply), then a shared prefix with a different question.
 
 ## Stop / restore
 Stop the servers (SIGTERM, then check `nvidia-smi` is empty on all four), hand back to the orchestrator for DeepSeek.
