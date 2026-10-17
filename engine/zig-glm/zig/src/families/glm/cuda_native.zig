@@ -124,7 +124,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     try own.lib.check(own.lib.api.ncclCommInitRank(&own.comm, @intCast(p.world), id, @intCast(p.rank)), "ncclCommInitRank");
     errdefer _ = own.lib.api.ncclCommDestroy(own.comm);
     const cap = capacity(o.context);
-    own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, &own.lib, own.comm, p.rank, p.world, .{ .capacity = cap, .mtp = o.drafts, .settings = set });
+    own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, &own.lib, own.comm, p.rank, p.world, .{ .capacity = cap, .mtp = o.drafts, .settings = set, .vision_tokens = if (o.vision) |v| v.image_tokens else 0 });
     errdefer own.e.deinit();
     own.link = try follow.Link.init(gpa, ctx.d, &own.lib, own.comm, own.e.stream, cap);
     errdefer own.link.deinit();

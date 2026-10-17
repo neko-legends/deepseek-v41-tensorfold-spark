@@ -17,6 +17,7 @@ pub const Options = struct {
     capacity: usize, // tokens a sequence holds
     mtp: bool, // load the MTP head (drafts)
     settings: ranks.Settings,
+    vision_tokens: u32 = 0, // ours: --vision's image tokens, agreed by every rank (0: off)
 };
 
 /// Rank 0's own word on its request (cancelled or not); the other ranks have none and hear rank 0's.
@@ -116,7 +117,7 @@ pub const Engine = struct {
         errdefer stream.deinit();
         const config_hash = try ranks.hashFile(a, io, cfg_path);
         const program_hash = try ranks.hashFile(a, io, "/proc/self/exe");
-        const fp = ranks.Fingerprint.of(
+        var fp = ranks.Fingerprint.of(
             world,
             rank,
             o.settings,
@@ -126,6 +127,7 @@ pub const Engine = struct {
             program_hash,
             checkpoint,
         );
+        fp.vision = o.vision_tokens;
         try ranks.agree(d, lib, comm, stream, fp, try a.alloc(ranks.Fingerprint, world));
         const share = try shard.Share.of(&c, rank, world);
         const spans = try gpa.alloc(shard.Span, world);

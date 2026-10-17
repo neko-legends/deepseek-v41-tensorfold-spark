@@ -60,7 +60,7 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 5, // this struct's version
+    layout: u32 = 6, // this struct's version (ours: 6 adds vision)
     world: u32,
     rank: u32,
     split: u32,
@@ -68,6 +68,8 @@ pub const Fingerprint = extern struct {
     pieces: u32,
     layers: u32, // TF_GLM_LAYERS (0: all)
     mtp: u32, // 1: the MTP head loads and runs (drafts on): every prompt pass adds its collectives
+    vision: u32 = 0, // ours: --vision's image tokens (0: off): every rank holds the rows and hears the images step
+    pad: u32 = 0,
     capacity: u64, // tokens a sequence holds
     heat_high: f64, // the heat bands in degrees (0 and 0: off): every rank must wait alike
     heat_low: f64,
@@ -84,6 +86,7 @@ pub const Fingerprint = extern struct {
         pieces,
         layers,
         mtp,
+        vision,
         capacity,
         heat_high,
         heat_low,
@@ -138,6 +141,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
             "pieces",
             "layers",
             "mtp",
+            "vision",
             "capacity",
             "heat_high",
             "heat_low",
@@ -213,6 +217,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .pieces => "TF_GLM_OVERLAP_PIECES",
         .layers => "TF_GLM_LAYERS",
         .mtp => "--no-drafts given to some ranks and not others",
+        .vision => "--vision (or --vision-image-tokens) given to some ranks and not others",
         .capacity => "the sequence capacity (the context)",
         .heat_high => "TF_HEAT_HIGH",
         .heat_low => "TF_HEAT_LOW",
@@ -264,4 +269,7 @@ test "fingerprints: agreeing ranks pass; the first differing field and rank are 
     try std.testing.expectEqual(Fingerprint.Field.checkpoint, mismatch(&all).?.field);
     all[1] = Fingerprint.of(2, 1, .{}, 8192, false, h0, h0, "/hub/snapshots/423acf37"); // --no-drafts on rank 1 only
     try std.testing.expectEqual(Mismatch{ .field = .mtp, .rank = 1 }, mismatch(&all).?);
+    all[1] = Fingerprint.of(2, 1, .{}, 8192, true, h0, h0, "/hub/snapshots/423acf37");
+    all[1].vision = 8000; // ours: --vision on rank 1 only
+    try std.testing.expectEqual(Mismatch{ .field = .vision, .rank = 1 }, mismatch(&all).?);
 }
