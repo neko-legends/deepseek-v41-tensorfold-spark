@@ -195,6 +195,7 @@ const Full = struct {
 const fulls = [_]Full{
     .{ .dim = 72, .warps = 8, .slots = 8 },
     .{ .dim = 80, .warps = 8 },
+    .{ .dim = 64, .warps = 8 }, // ours: GLM-5.3-Flash's tower
 };
 
 /// Every row of a picture over every key (no mask), a block a head and 128 rows.

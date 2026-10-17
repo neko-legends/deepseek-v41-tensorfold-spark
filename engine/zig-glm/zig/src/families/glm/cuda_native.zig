@@ -11,6 +11,7 @@ const ranks = @import("cuda_ranks.zig");
 const fw = @import("cuda_forward.zig");
 const config = @import("config.zig");
 const shard = @import("cuda_shard.zig");
+const vision = @import("cuda_vision.zig");
 
 pub const model_type = "glm5_next";
 pub const formats: []const []const u8 = &.{ "modelopt-nvfp4", "modelopt-mixed" };
@@ -32,7 +33,11 @@ pub const Options = struct {
     segments: usize = 1,
     slide: bool = false,
     room: ?Room = null,
+    vision: ?vision.Limits = null, // ours: --vision (the image tower on rank 0, image rows on every rank)
 };
+
+/// Ours: --vision's default image tokens a request holds: the processor's max_image_tokens, so one image's grid is HF's.
+pub const default_image_tokens: u32 = 8000;
 /// The smallest room among the other ranks and whose it is.
 pub const Peer = struct { bytes: u64, rank: usize };
 
@@ -50,6 +55,7 @@ pub const Loaded = struct {
     lone: ?LoneRun = null,
     target: *engine.Engine, // the prompt cache keeps this engine's states (snap_*)
     peer_room: ?Peer = null, // rank 0: the server admits streams and kept states by this when it is smaller
+    vision: ?*vision.Vision = null, // ours: rank 0's tower with --vision (native/cuda_vision_offer.zig offers it)
 };
 
 /// This rank's place: TF_GLM_RANK of TF_GLM_WORLD (both, or neither for a refusal that names them).
@@ -91,6 +97,8 @@ const Owned = struct {
     e: *engine.Engine,
     link: follow.Link,
     lanes: glm_lanes.Lanes,
+    images: ?*vision.Images = null,
+    vision: ?*vision.Vision = null,
 };
 
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
@@ -117,6 +125,19 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer own.e.deinit();
     own.link = try follow.Link.init(gpa, ctx.d, &own.lib, own.comm, own.e.stream, cap);
     errdefer own.link.deinit();
+    // ours: --vision: the rows buffer on every rank, the tower on rank 0 (before the rooms are read: its memory counts)
+    own.images = null;
+    own.vision = null;
+    if (o.vision) |lim| {
+        own.images = try vision.Images.init(gpa, ctx.d, lim.image_tokens, own.e.c.hidden);
+        own.e.images = own.images;
+        if (p.rank == 0) own.vision = vision.Vision.init(gpa, io, ctx.d, dir, lim) catch |err| {
+            std.log.err("--vision: the image tower does not load ({s})", .{@errorName(err)});
+            return err;
+        };
+    }
+    errdefer if (own.vision) |v| v.deinit();
+    errdefer if (own.images) |im| im.deinit();
     // Rank 0 admits by the smallest room of the ranks; its sizes are the largest (the first ranks take the remainder).
     const rooms = try gpa.alloc(u64, p.world);
     defer gpa.free(rooms);
@@ -140,7 +161,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
             return if (std.c.getenv(name)) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
         }
     }.get;
-    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED") };
+    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED"), .vision = own.vision };
     return .{
         .backend = own.lanes.backend(),
         .facts = own.lanes.facts(),
@@ -151,6 +172,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .deinit = close,
         .target = own.e,
         .peer_room = peer,
+        .vision = own.vision,
     };
 }
 
@@ -194,6 +216,9 @@ fn close(ptr: *anyopaque) void {
     own.lanes.x.end() catch {};
     own.lanes.deinit();
     own.link.deinit();
+    if (own.vision) |v| v.deinit();
+    own.e.images = null;
+    if (own.images) |im| im.deinit();
     own.e.deinit();
     _ = own.lib.api.ncclCommDestroy(own.comm);
     own.lib.close();

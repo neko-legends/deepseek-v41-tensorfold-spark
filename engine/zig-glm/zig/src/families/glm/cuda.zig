@@ -22,8 +22,12 @@ pub const engine = @import("cuda_engine.zig");
 pub const follow = @import("cuda_follow.zig");
 pub const lanes = @import("cuda_lanes.zig");
 pub const native = @import("cuda_native.zig");
+pub const vision = @import("cuda_vision.zig"); // ours: the image tower on CUDA
+pub const image_patches = @import("image_patches.zig");
 
 test {
+    _ = vision;
+    _ = image_patches;
     _ = experts;
     _ = glue;
     _ = kda;

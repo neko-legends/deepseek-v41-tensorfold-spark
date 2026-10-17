@@ -6,7 +6,7 @@ const engine = @import("cuda_engine.zig");
 const sampler = @import("cuda_sampler.zig");
 const Engine = engine.Engine;
 
-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, redraw };
+pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, redraw, images };
 
 /// Ours: verify and shared steps whose draws are structured output (Engine.Masked: every rank gathers the rows).
 pub const masked_flag: u32 = 2;
@@ -180,6 +180,17 @@ pub const Leader = struct {
         try x.e.verify(ids, out, .{ .on = on, .bits = masks });
     }
 
+    /// Ours: the bound stream's prompt pass reads `spans`' image rows (rank 0's buffer, filled by the tower): the spans
+    /// as (at, n, row) ids, then the rows broadcast (Engine.imagesBegin).
+    pub fn images(x: Leader, spans: []const @import("cuda_vision.zig").Span) !void {
+        try x.flush();
+        var ids: std.ArrayList(u32) = .empty;
+        defer ids.deinit(x.e.gpa);
+        for (spans) |sp| try ids.appendSlice(x.e.gpa, &.{ sp.at, sp.n, sp.row });
+        try x.send(.{ .kind = @backingInt(Kind.images) }, ids.items);
+        try x.e.imagesBegin(spans);
+    }
+
     /// Ours: the prompt's first token drawn again among `mask`'s allowed tokens, on every rank (Engine.redrawFirst).
     pub fn redraw(x: Leader, len: usize, mask: []const u32) !u32 {
         try x.flush();
@@ -255,6 +266,14 @@ pub fn follow(e: *Engine, link: *Link) !void {
             },
             .verify => try e.verify(step.ids, sampled[0..step.ids.len], .{ .on = h.flags & masked_flag != 0 }),
             .redraw => _ = try e.redrawFirst(@intCast(h.a), .{ .on = true }),
+            .images => {
+                if (step.ids.len % 3 != 0) return error.BadStep;
+                var spans: std.ArrayList(@import("cuda_vision.zig").Span) = .empty;
+                defer spans.deinit(e.gpa);
+                var i: usize = 0;
+                while (i < step.ids.len) : (i += 3) try spans.append(e.gpa, .{ .at = step.ids[i], .n = step.ids[i + 1], .row = step.ids[i + 2], .image = 0 });
+                try e.imagesBegin(spans.items);
+            },
             .shared => {
                 const k = h.depth;
                 if (k == 0 or k > engine.max_shared or step.ids.len < 2 * k) return error.BadStep;

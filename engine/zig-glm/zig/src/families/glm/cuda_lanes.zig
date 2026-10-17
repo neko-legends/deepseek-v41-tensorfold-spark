@@ -29,6 +29,7 @@ pub const Lanes = struct {
     alone: bool = false, // each window in its own forward (TF_GLM_SHARED=0)
     shared: u64 = 0, // forwards that held several streams' windows (checks read it)
     lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
+    vision: ?*@import("cuda_vision.zig").Vision = null, // ours (--vision, rank 0): the image tower
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
 
@@ -122,6 +123,7 @@ pub const Lanes = struct {
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
         const self = of(ptr);
         const from = try self.opening(s);
+        try self.encodeImages(s, from);
         _ = self.take(try self.x.prefill(s.prompt(), from, .{ .ptr = s, .check = cancelled }, marksOf(s)));
     }
 
@@ -130,6 +132,7 @@ pub const Lanes = struct {
         const self = of(ptr);
         const going: ?usize = if (self.lanes.getPtr(s)) |l| l.fill else null;
         const from = if (going == null) try self.opening(s) else null;
+        if (going == null) try self.encodeImages(s, from);
         const l = self.lanes.getPtr(s).?;
         if (going != null) try self.x.bind(l.slot);
         const at = going orelse if (from) |r| r.at else 0;
@@ -156,6 +159,22 @@ pub const Lanes = struct {
         try self.x.begin(s.sampling);
         s.cached = 0;
         return self.resumeFrom(s, ids.len);
+    }
+
+    /// Ours: a prompt pass with images: the tower fills the rows of the images that end past where the pass starts,
+    /// and every rank gets them (Leader.images) before the first chunk.
+    fn encodeImages(self: *Lanes, s: *lanes.Stream, from: ?engine.Resume) !void {
+        if (s.images.len == 0) return;
+        const v = self.vision orelse return error.NoVisionTower;
+        const im = self.x.e.images orelse return error.NoVisionTower;
+        const vis = @import("cuda_vision.zig");
+        const spans = try vis.plan(self.x.e.gpa, s.images, if (from) |r| @intCast(r.at) else 0);
+        defer self.x.e.gpa.free(spans);
+        if (spans.len == 0) return;
+        if (vis.total(spans) > im.limit) return error.ImageRows;
+        if (im.active and im.slot != self.x.e.slot) return error.ImagePassBusy; // one image pass at a time (a buffer)
+        try v.tower.encode(self.x.e.stream, s.images, spans, im);
+        try self.x.images(spans);
     }
 
     fn marksOf(s: *lanes.Stream) ?engine.Marks {

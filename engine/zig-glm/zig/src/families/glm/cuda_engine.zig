@@ -11,6 +11,7 @@ const ranks = @import("cuda_ranks.zig");
 const sampler = @import("cuda_sampler.zig");
 const heat = @import("heat");
 const modelopt = @import("core").modelopt;
+const vision = @import("cuda_vision.zig");
 
 pub const Options = struct {
     capacity: usize, // tokens a sequence holds
@@ -93,6 +94,7 @@ pub const Engine = struct {
     dropped: std.ArrayList(u32) = .empty, // rank 0: ids dropped since the other ranks last heard (cuda_follow)
     masked: Masked = .{}, // ours: the current step's structured-output draws (draw)
     rows_host: []u16 = &.{}, // ours: rank 0's gathered bf16 rows for a masked greedy pick, made at the first
+    images: ?*vision.Images = null, // ours (--vision): the prompt pass's image rows, on every rank
 
     /// Opens rank `rank` of `world` over `comm`; the ranks agree on settings (cuda_ranks) before the weights load.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, checkpoint: []const u8, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize, o: Options) !*Engine {
@@ -195,7 +197,8 @@ pub const Engine = struct {
 
     fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .kda_wide = e.settings.kda_wide };
+        const images = if (b == &e.bp) if (e.images) |im| im.splice(e.slot) else null else null;
+        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .kda_wide = e.settings.kda_wide, .images = images };
     }
 
     /// Binds slot `slot`'s sequence for the steps that follow, making it (a zeroed state) on first use.
@@ -241,6 +244,17 @@ pub const Engine = struct {
         e.cur.sampling = sampler.check(sampling);
         e.cur.in_head = 0;
         try e.cur.st.reset(e.stream);
+        if (e.images) |im| if (im.slot == e.slot) im.clear();
+    }
+
+    /// Ours: the bound stream's prompt pass reads `spans`' image rows: rank 0's (the tower filled them) broadcast to
+    /// every rank's buffer, spliced into its prompt chunks until the pass ends.
+    pub fn imagesBegin(e: *Engine, spans: []const vision.Span) !void {
+        const im = e.images orelse return error.NoVision;
+        try im.set(spans, e.slot);
+        errdefer im.clear();
+        const bytes = im.bytes(spans);
+        if (bytes > 0) try e.lib.check(e.lib.api.ncclBroadcast(im.buf.ptr, im.buf.ptr, bytes, .u8, 0, e.comm, e.stream.handle), "ncclBroadcast");
     }
 
     /// decode.prefill: `ids` in 2,048-row chunks, then the first token from the last row; `from` restores a kept state.
@@ -273,6 +287,7 @@ pub const Engine = struct {
         try e.gate(cancel);
         try f.run(as_i32[0..rows]);
         const last = start + rows == len;
+        defer if (last) if (e.images) |im| im.clear(); // ours: the pass's image rows splice no later pass
         var first: ?u32 = null;
         if (last) {
             var t: [1]u32 = undefined;

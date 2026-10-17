@@ -147,3 +147,120 @@ extern "C" __global__ void __launch_bounds__(NT) tf_vit_position_add(const __nv_
         O[at + c] = __float2bfloat16_rn(__fadd_rn(rbf(p), bf(X[at + c])));
     }
 }
+
+// ---- ours: GLM-5.3-Flash's tower (families/glm/cuda_vision.zig), HF Glm5NextVisionModel's bf16 rounding points ----
+
+namespace {
+
+constexpr int GLMV_MAXE = 16;  // the merger's LayerNorm: rows up to NT * 16 = 4096 wide
+
+// fp32 sum of squares of a row's elements this thread holds, across the block (fixed order).
+__device__ __forceinline__ float glmv_rstd(float ss, int D, float eps, float* red) {
+    const float var = __fdiv_rn(block_sum(ss, red), static_cast<float>(D));
+    return __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(var, eps)));
+}
+
+}  // namespace
+
+// Block a row: Glm5NextRMSNorm in bf16, y = bf16(w * bf16(x * rsqrt(mean(x^2) + eps))), rows up to 2048 wide.
+extern "C" __global__ void __launch_bounds__(NT) tf_glmv_rms(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W,
+                                                              __nv_bfloat16* __restrict__ Y, int D, float eps) {
+    __shared__ float red[NT / 32];
+    const int64_t at = static_cast<int64_t>(blockIdx.x) * D;
+    float x[MAXE];
+    float ss = 0.0f;
+#pragma unroll
+    for (int k = 0; k < MAXE; ++k) {
+        const int i = threadIdx.x + k * NT;
+        if (i >= D) continue;
+        x[k] = bf(X[at + i]);
+        ss = __fmaf_rn(x[k], x[k], ss);
+    }
+    const float rstd = glmv_rstd(ss, D, eps, red);
+#pragma unroll
+    for (int k = 0; k < MAXE; ++k) {
+        const int i = threadIdx.x + k * NT;
+        if (i < D) Y[at + i] = __float2bfloat16_rn(__fmul_rn(bf(W[i]), rbf(__fmul_rn(x[k], rstd))));
+    }
+}
+
+// Block a row of qkv [rows, 3 * 16 * 64] (a patch, block-major over 2x2 windows of a grid gw patches wide): its q and
+// k heads RMS-normed over the 64 dims (q_norm / k_norm, rounded as tf_glmv_rms), then the 2-D rope in fp32 with the
+// patch's (h, w): angle j < 16 = h * INV[j], 16 <= j < 32 = w * INV[j - 16], dims j and j + 32 alike; rotate_half over
+// all 64; bf16 back in place. A warp a head (32 heads: 16 q, then 16 k), two dims a lane.
+extern "C" __global__ void __launch_bounds__(NT) tf_glmv_qk_rope(__nv_bfloat16* __restrict__ QKV, const __nv_bfloat16* __restrict__ QW,
+                                                                  const __nv_bfloat16* __restrict__ KW, const float* __restrict__ INV, int gw,
+                                                                  float eps) {
+    constexpr int H = 16, Dh = 64;
+    const int r = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int win = r >> 2, wx_n = gw >> 1;
+    const float ph = static_cast<float>((win / wx_n) * 2 + ((r >> 1) & 1));
+    const float pw = static_cast<float>((win % wx_n) * 2 + (r & 1));
+    for (int head = warp; head < 2 * H; head += NT / 32) {
+        __nv_bfloat16* x = QKV + static_cast<int64_t>(r) * 3 * H * Dh + head * Dh;  // q heads 0..15, k heads 16..31
+        const __nv_bfloat16* w = head < H ? QW : KW;
+        const float a = bf(x[lane]), b = bf(x[lane + 32]);
+        const float ss = warp_sum(__fmaf_rn(b, b, __fmul_rn(a, a)));
+        const float rstd = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(ss, static_cast<float>(Dh)), eps)));
+        const float na = rbf(__fmul_rn(bf(w[lane]), rbf(__fmul_rn(a, rstd))));
+        const float nb = rbf(__fmul_rn(bf(w[lane + 32]), rbf(__fmul_rn(b, rstd))));
+        const float angle = __fmul_rn(lane < 16 ? ph : pw, INV[lane & 15]);
+        float s, c;
+        sincosf(angle, &s, &c);
+        // dims lane and lane + 32 share the angle: out_lo = lo * c - hi * s, out_hi = hi * c + lo * s
+        x[lane] = __float2bfloat16_rn(__fadd_rn(__fmul_rn(na, c), __fmul_rn(-nb, s)));
+        x[lane + 32] = __float2bfloat16_rn(__fadd_rn(__fmul_rn(nb, c), __fmul_rn(na, s)));
+    }
+}
+
+// Element i of [rows, N] from GU [rows, 2N] (a row's gate then up): bf16(bf16(silu(min(g, L))) * clamp(u, -L, L)).
+extern "C" __global__ void __launch_bounds__(NT) tf_glmv_swiglu(const __nv_bfloat16* __restrict__ GU, __nv_bfloat16* __restrict__ O, int64_t rows,
+                                                                 int N, float limit) {
+    const int64_t at = static_cast<int64_t>(blockIdx.x) * NT + threadIdx.x;
+    if (at >= rows * N) return;
+    const int64_t row = at / N, c = at % N;
+    const float g = fminf(bf(GU[row * 2 * N + c]), limit);
+    const float u = fminf(fmaxf(bf(GU[row * 2 * N + N + c]), -limit), limit);
+    O[at] = __float2bfloat16_rn(__fmul_rn(rbf(tf_silu(g)), u));
+}
+
+// tf_vit_layer_norm for rows up to 4096 wide (the merger's post_projection_norm).
+extern "C" __global__ void __launch_bounds__(NT) tf_glmv_layer_norm(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W,
+                                                                     const __nv_bfloat16* __restrict__ B, __nv_bfloat16* __restrict__ Y, int D,
+                                                                     float eps) {
+    __shared__ float red[NT / 32];
+    const int64_t at = static_cast<int64_t>(blockIdx.x) * D;
+    float x[GLMV_MAXE];
+    float acc = 0.0f;
+#pragma unroll
+    for (int k = 0; k < GLMV_MAXE; ++k) {
+        const int i = threadIdx.x + k * NT;
+        if (i >= D) continue;
+        x[k] = bf(X[at + i]);
+        acc = __fadd_rn(acc, x[k]);
+    }
+    const float mean = __fdiv_rn(block_sum(acc, red), static_cast<float>(D));
+    acc = 0.0f;
+#pragma unroll
+    for (int k = 0; k < GLMV_MAXE; ++k) {
+        if (threadIdx.x + k * NT >= D) continue;
+        x[k] = __fsub_rn(x[k], mean);
+        acc = __fadd_rn(acc, __fmul_rn(x[k], x[k]));
+    }
+    const float var = __fdiv_rn(block_sum(acc, red), static_cast<float>(D));
+    const float rstd = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(var, eps)));
+#pragma unroll
+    for (int k = 0; k < GLMV_MAXE; ++k) {
+        const int i = threadIdx.x + k * NT;
+        if (i < D) Y[at + i] = __float2bfloat16_rn(__fadd_rn(__fmul_rn(__fmul_rn(x[k], rstd), bf(W[i])), bf(B[i])));
+    }
+}
+
+// Block (row, column block) of `rows` image rows [rows, D] into the stream rows [rows][C][D] (every hc copy).
+extern "C" __global__ void __launch_bounds__(NT) tf_glmv_splice(const __nv_bfloat16* __restrict__ SRC, __nv_bfloat16* __restrict__ DST, int D,
+                                                                 int C) {
+    const int r = blockIdx.x, i = blockIdx.y * NT + threadIdx.x;
+    if (i >= D) return;
+    const __nv_bfloat16 v = SRC[static_cast<int64_t>(r) * D + i];
+    for (int c = 0; c < C; ++c) DST[(static_cast<int64_t>(r) * C + c) * D + i] = v;
+}

@@ -255,3 +255,6 @@ template __global__ void tf_prefill_attention::full_kernel<72, 8, 8>(const __nv_
 // Head dim 80, eight warps, two blocks an SM (RADIO's tower, 16 heads of 80): full_kernel<80>'s bits, 1.35x faster.
 template __global__ void tf_prefill_attention::vision_kernel<80, 8>(const __nv_bfloat16*, __nv_bfloat16*, int, int,
     float);
+// Head dim 64, eight warps (ours: GLM-5.3-Flash's tower, 16 heads of 64).
+template __global__ void tf_prefill_attention::vision_kernel<64, 8>(const __nv_bfloat16*, __nv_bfloat16*, int, int,
+    float);

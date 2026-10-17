@@ -2,6 +2,7 @@
 const std = @import("std");
 const api = @import("engine_api");
 const nemotron = @import("nemotron");
+const glm_cuda = @import("glm_cuda");
 const Allocator = std.mem.Allocator;
 
 /// Info.vision for a Nemotron Omni engine's tower; null without --vision.
@@ -15,4 +16,22 @@ pub fn offer(v: ?*nemotron.native.vision.Vision) ?api.Vision {
         }
     }.f;
     return .{ .ctx = x, .prepare = prepare, .image_token = x.marks.image, .markers = &x.mark_ids, .wrap = .{ x.marks.open, x.marks.close }, .image_tokens = x.limits.image_tokens, .max_images = x.limits.max_images, .explain = nemotron.native.vision.Vision.explain };
+}
+
+/// Ours: Info.vision for GLM-5.3-Flash's CUDA tower (rank 0's); the template writes the markers itself (no wrap).
+pub fn glm(v: ?*glm_cuda.vision.Vision) ?api.Vision {
+    const x = v orelse return null;
+    const prepare = struct {
+        fn f(ctx: *anyopaque, a: Allocator, bytes: []const u8, max_tokens: u32) anyerror!api.PreparedImage {
+            const t: *glm_cuda.vision.Vision = @ptrCast(@alignCast(ctx));
+            const p = try t.prepare(a, bytes, max_tokens);
+            return .{ .pixels = p.pixels, .gh = p.gh, .gw = p.gw, .tokens = p.tokens, .hash = p.hash };
+        }
+    }.f;
+    return .{ .ctx = x, .prepare = prepare, .image_token = x.c.image_token, .markers = &x.markers, .image_tokens = x.limits.image_tokens, .max_images = x.limits.max_images, .explain = glm_cuda.vision.Vision.explain };
+}
+
+/// The offer for whichever tower `v` is (Nemotron Omni's or, ours, GLM-5.3-Flash's).
+pub fn of(v: anytype) ?api.Vision {
+    return if (@TypeOf(v) == ?*glm_cuda.vision.Vision) glm(v) else offer(v);
 }
