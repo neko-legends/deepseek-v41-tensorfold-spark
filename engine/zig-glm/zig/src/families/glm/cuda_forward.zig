@@ -159,6 +159,7 @@ pub const Forward = struct {
     pieces: ?*const Pieces = null, // a prompt chunk's exchanges in row pieces on a second stream (null: whole)
     split: bool = true, // TF_GLM_PREFILL_REDUCE=split (the default with send/recv): each rank glues its own rows
     images: ?@import("cuda_vision.zig").Splice = null, // ours: a prompt chunk's image rows over its placeholders' embeddings
+    mtp_at: usize = 0, // ours: the prompt position of an MTP absorb's first id (its image rows splice from there)
 
     pub fn set(f: *const Forward) glue.Set {
         return .{ .glue = &f.m.glue };
@@ -537,6 +538,7 @@ pub const Forward = struct {
             const b = r.b;
             try glue.embedB16(f.set(), f.stream, b.ids, r.w.embed, b.me, n, D, 1);
             if (r.st.mtp_len == 0) try f.d.check(f.d.api.cuMemsetD8Async(b.me, 0, D * 2, f.stream.handle), "cuMemsetD8Async"); // position 0's embedding is zeroed
+            if (f.images) |im| try im.run(f.stream, f.mtp_at, n, b.me, 1); // ours: the head reads the image rows too
             try glue.rmsnorm(f.set(), f.stream, b.me, D, m.enorm, b.mcat, 2 * D, null, c.eps, n, D);
             try glue.rmsnorm(f.set(), f.stream, b.hin, D, m.hnorm, b.mcat + D * 2, 2 * D, null, c.eps, n, D);
             try b16.matmul(f.set(), f.stream, b.mcat, 2 * D, m.eh, b.mx, b.kda.mm_part, n, D, 2 * D, false);

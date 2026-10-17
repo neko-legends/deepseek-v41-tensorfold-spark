@@ -72,7 +72,8 @@ pub fn run(gpu: Gpu, model: []const u8, ref: []const u8, image: ?[]const u8) !vo
         std.debug.print("RESULT processor: grid {d} x {d} (HF {d} x {d}), max |patch - HF| {e:.3}\n", .{ p.gh, p.gw, gh, gw, most });
         try check.expect(p.gh == gh and p.gw == gw and most < 0.05, "the processor's patches match HF's", .{});
     }
-    const s = try cuda.Stream.init(gpu.d, false);
+    var s = try cuda.Stream.init(gpu.d, false);
+    defer s.deinit();
     const t = &v.tower;
     const H = 1024;
     const host = try gpa.alloc(u16, P * 4096);

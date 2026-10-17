@@ -130,9 +130,13 @@ pub const Lanes = struct {
     /// One chunk of the stream's prompt pass (fillOne runs other rounds between); true once the first token is drawn.
     fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
         const self = of(ptr);
+        // ours: an image prompt passes whole (one rows buffer: no other image pass may start between its chunks)
+        if (s.images.len > 0) {
+            try prefillFn(ptr, s);
+            return true;
+        }
         const going: ?usize = if (self.lanes.getPtr(s)) |l| l.fill else null;
         const from = if (going == null) try self.opening(s) else null;
-        if (going == null) try self.encodeImages(s, from);
         const l = self.lanes.getPtr(s).?;
         if (going != null) try self.x.bind(l.slot);
         const at = going orelse if (from) |r| r.at else 0;
@@ -172,7 +176,6 @@ pub const Lanes = struct {
         defer self.x.e.gpa.free(spans);
         if (spans.len == 0) return;
         if (vis.total(spans) > im.limit) return error.ImageRows;
-        if (im.active and im.slot != self.x.e.slot) return error.ImagePassBusy; // one image pass at a time (a buffer)
         try v.tower.encode(self.x.e.stream, s.images, spans, im);
         try self.x.images(spans);
     }

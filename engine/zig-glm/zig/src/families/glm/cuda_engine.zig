@@ -93,7 +93,7 @@ pub const Engine = struct {
     announce: u64 = 0, // rank 0: a state kept at this chunk's mark, for the other ranks to copy at its gate
     dropped: std.ArrayList(u32) = .empty, // rank 0: ids dropped since the other ranks last heard (cuda_follow)
     masked: Masked = .{}, // ours: the current step's structured-output draws (draw)
-    rows_host: []u16 = &.{}, // ours: rank 0's gathered bf16 rows for a masked greedy pick, made at the first
+    rows_host: []u16 = &.{}, // ours: rank 0's gathered bf16 rows for a masked greedy pick, made at its first
     images: ?*vision.Images = null, // ours (--vision): the prompt pass's image rows, on every rank
 
     /// Opens rank `rank` of `world` over `comm`; the ranks agree on settings (cuda_ranks) before the weights load.
@@ -282,7 +282,7 @@ pub const Engine = struct {
         const rows = @min(len - start, fw.prefill_rows);
         if (part.len != @min(len - start, rows + 1)) return error.BadChunk;
         var one: [1]fw.Rank = undefined;
-        const f = e.view(&e.bp, &one);
+        var f = e.view(&e.bp, &one);
         const as_i32: []const i32 = @ptrCast(part);
         if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
         try e.gate(cancel);
@@ -299,6 +299,7 @@ pub const Engine = struct {
             if (last) try e.copy(e.hold.ptr, e.bp.fnormed + (rows - 1) * e.c.hidden * 2, e.c.hidden * 2);
             const nxt = as_i32[1..];
             if (nxt.len > 0) { // decode._absorb_rows
+                f.mtp_at = start + 1;
                 try f.mtp(nxt, &.{e.bp.fnormed});
                 try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + nxt.len);
             }
@@ -428,10 +429,15 @@ pub const Engine = struct {
         try e.draw(e.bd.logits, ids.len, at + 1, out);
     }
 
+    /// Ours: redrawFirst's position, checked by rank 0 before it sends the step (a follower's error would end it).
+    pub fn redrawCheck(e: *const Engine, len: usize) !void {
+        if (len == 0 or len != e.cur.st.pos) return error.PositionMismatch; // the pass committed the prompt
+    }
+
     /// Ours: the prompt's first token drawn again from its last row (the prompt pass's draw is unmasked), among
     /// `masked`'s allowed tokens; the prompt buffers still hold that row (Backend.first_masked follows the pass).
     pub fn redrawFirst(e: *Engine, len: usize, masked: Masked) !u32 {
-        if (len == 0 or len != e.cur.st.pos) return error.PositionMismatch; // the pass committed the prompt
+        try e.redrawCheck(len);
         e.masked = masked;
         defer e.masked = .{};
         var t: [1]u32 = undefined;

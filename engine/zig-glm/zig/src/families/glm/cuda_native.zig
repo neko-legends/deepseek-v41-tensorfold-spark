@@ -36,6 +36,9 @@ pub const Options = struct {
     vision: ?vision.Limits = null, // ours: --vision (the image tower on rank 0, image rows on every rank)
 };
 
+/// Ours: rank 0's room when its image tower failed to load (a room no rank reads otherwise): the others stop too.
+const tower_failed_room: u64 = std.math.maxInt(u64) - 0x7f;
+
 /// Ours: --vision's default image tokens a request holds: the processor's max_image_tokens, so one image's grid is HF's.
 pub const default_image_tokens: u32 = 8000;
 /// The smallest room among the other ranks and whose it is.
@@ -128,21 +131,25 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     // ours: --vision: the rows buffer on every rank, the tower on rank 0 (before the rooms are read: its memory counts)
     own.images = null;
     own.vision = null;
+    errdefer if (own.images) |im| im.deinit();
+    errdefer if (own.vision) |v| v.deinit();
+    var tower_failed: ?anyerror = null; // rank 0's, told the other ranks in the rooms' exchange: all stop together
     if (o.vision) |lim| {
         own.images = try vision.Images.init(gpa, ctx.d, lim.image_tokens, own.e.c.hidden);
         own.e.images = own.images;
-        if (p.rank == 0) own.vision = vision.Vision.init(gpa, io, ctx.d, dir, lim) catch |err| {
+        if (p.rank == 0) own.vision = vision.Vision.init(gpa, io, ctx.d, dir, lim) catch |err| blk: {
             std.log.err("--vision: the image tower does not load ({s})", .{@errorName(err)});
-            return err;
+            tower_failed = err;
+            break :blk null;
         };
     }
-    errdefer if (own.vision) |v| v.deinit();
-    errdefer if (own.images) |im| im.deinit();
     // Rank 0 admits by the smallest room of the ranks; its sizes are the largest (the first ranks take the remainder).
     const rooms = try gpa.alloc(u64, p.world);
     defer gpa.free(rooms);
-    const mine: u64 = if (o.room) |r| r.read(r.ctx) orelse 0 else std.math.maxInt(u64);
+    const mine: u64 = if (tower_failed != null) tower_failed_room else if (o.room) |r| r.read(r.ctx) orelse 0 else std.math.maxInt(u64);
     try ranks.gather(u64, ctx.d, &own.lib, own.comm, own.e.stream, p.rank, mine, rooms);
+    if (tower_failed) |err| return err;
+    if (rooms[0] == tower_failed_room) return error.VisionTowerFailed; // rank 0's tower did not load
     var peer: ?Peer = null;
     for (rooms[1..], 1..) |r, q| if (peer == null or r < peer.?.bytes) {
         peer = .{ .bytes = r, .rank = q };

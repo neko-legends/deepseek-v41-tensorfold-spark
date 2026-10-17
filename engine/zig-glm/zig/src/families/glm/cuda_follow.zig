@@ -183,6 +183,8 @@ pub const Leader = struct {
     /// Ours: the bound stream's prompt pass reads `spans`' image rows (rank 0's buffer, filled by the tower): the spans
     /// as (at, n, row) ids, then the rows broadcast (Engine.imagesBegin).
     pub fn images(x: Leader, spans: []const @import("cuda_vision.zig").Span) !void {
+        const im = x.e.images orelse return error.NoVision;
+        for (spans) |sp| if (sp.row + sp.n > im.limit) return error.ImageRows; // checked before the step goes out
         try x.flush();
         var ids: std.ArrayList(u32) = .empty;
         defer ids.deinit(x.e.gpa);
@@ -193,6 +195,7 @@ pub const Leader = struct {
 
     /// Ours: the prompt's first token drawn again among `mask`'s allowed tokens, on every rank (Engine.redrawFirst).
     pub fn redraw(x: Leader, len: usize, mask: []const u32) !u32 {
+        try x.e.redrawCheck(len);
         try x.flush();
         try x.send(.{ .kind = @backingInt(Kind.redraw), .a = len }, &.{});
         return x.e.redrawFirst(len, .{ .on = true, .bits = mask });
